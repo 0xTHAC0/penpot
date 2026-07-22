@@ -31,6 +31,11 @@
    [frontend-tests.logic.groups-test]
    [frontend-tests.logic.nudge-selected-shapes-test]
    [frontend-tests.logic.pasting-in-containers-test]
+   [frontend-tests.logic.path-actions-test]
+   [frontend-tests.logic.path-clipboard-test]
+   [frontend-tests.logic.path-helpers-test]
+   [frontend-tests.logic.path-lifecycle-test]
+   [frontend-tests.logic.path-tools-test]
    [frontend-tests.main-errors-test]
    [frontend-tests.plugins.comments-test]
    [frontend-tests.plugins.context-shapes-test]
@@ -118,6 +123,11 @@
    'frontend-tests.logic.frame-guides-test
    'frontend-tests.logic.groups-test
    'frontend-tests.logic.nudge-selected-shapes-test
+   'frontend-tests.logic.path-actions-test
+   'frontend-tests.logic.path-clipboard-test
+   'frontend-tests.logic.path-helpers-test
+   'frontend-tests.logic.path-lifecycle-test
+   'frontend-tests.logic.path-tools-test
    'frontend-tests.logic.pasting-in-containers-test
    'frontend-tests.main-errors-test
    'frontend-tests.plugins.comments-test

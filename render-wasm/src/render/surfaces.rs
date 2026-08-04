@@ -16,18 +16,10 @@ const TEXTURES_BATCH_DELETE: usize = 256;
 
 // This is the amount of extra space we're going to give to all the surfaces to render shapes.
 // If it's too big it could affect performance.
-const TILE_SIZE: i32 = tiles::TILE_SIZE as i32;
 const TILE_SIZE_MULTIPLIER: i32 = 2;
-const TILE_MARGIN_SIZE: i32 = TILE_SIZE * TILE_SIZE_MULTIPLIER / 4;
-const TILE_DRAWABLE_RECT: IRect = IRect {
-    left: TILE_MARGIN_SIZE,
-    top: TILE_MARGIN_SIZE,
-    right: TILE_MARGIN_SIZE + TILE_SIZE,
-    bottom: TILE_MARGIN_SIZE + TILE_SIZE,
-};
 const DOC_ATLAS_MAX_DIM: i32 = 4096;
 
-pub fn get_cache_size(viewbox: &Viewbox, interest: i32) -> skia::ISize {
+pub fn get_cache_size(viewbox: &Viewbox, interest: i32, tile_size_px: i32) -> skia::ISize {
     // First we retrieve the extended area of the viewport that we could render.
     let TileRect(isx, isy, iex, iey) =
         tiles::get_tiles_for_viewbox_with_interest(viewbox, interest);
@@ -36,8 +28,8 @@ pub fn get_cache_size(viewbox: &Viewbox, interest: i32) -> skia::ISize {
     let dy = if isy.signum() != iey.signum() { 1 } else { 0 };
 
     (
-        ((iex - isx).abs() + dx) * TILE_SIZE,
-        ((iey - isy).abs() + dy) * TILE_SIZE,
+        ((iex - isx).abs() + dx) * tile_size_px,
+        ((iey - isy).abs() + dy) * tile_size_px,
     )
         .into()
 }
@@ -169,7 +161,7 @@ impl DocAtlas {
         }
 
         // Add padding to reduce realloc frequency.
-        let pad = tiles::TILE_SIZE;
+        let pad = tiles::TILE_SIZE_BASE;
         new_left -= pad;
         new_top -= pad;
         new_right += pad;
@@ -182,7 +174,7 @@ impl DocAtlas {
         // Keep the highest possible scale (closest to 1.0) that still fits.
         let cap = gpu_state
             .max_texture_size()
-            .clamp(TILE_SIZE, DOC_ATLAS_MAX_DIM) as f32;
+            .clamp(tiles::TILE_SIZE_BASE as i32, DOC_ATLAS_MAX_DIM) as f32;
 
         let required_scale = (cap / doc_w).min(cap / doc_h).clamp(0.01, 1.0);
 
@@ -435,6 +427,8 @@ pub struct Surfaces {
     // Tracks which surfaces have content (dirty flag bitmask)
     dirty_surfaces: u32,
     extra_tile_dims: skia::ISize,
+    /// Device-pixel size of one tile (512 at DPR=1, 1024 at DPR=2, …).
+    tile_size_px: i32,
     dpr: f32,
 }
 
@@ -446,6 +440,7 @@ impl Surfaces {
         tile_dims: skia::ISize,
     ) -> Result<Self> {
         let gpu_state = get_gpu_state();
+        let tile_size_px = tile_dims.width;
 
         let extra_tile_dims = skia::ISize::new(
             tile_dims.width * TILE_SIZE_MULTIPLIER,
@@ -484,9 +479,9 @@ impl Surfaces {
         let ui = gpu_state.create_surface_with_dimensions("ui".to_string(), width, height)?;
         let debug = gpu_state.create_surface_with_dimensions("debug".to_string(), width, height)?;
 
-        // 512, why not?
-        let tiles = TileTextureCache::new(tile_atlas.width(), 512);
+        let tiles = TileTextureCache::new(tile_atlas.width(), tile_size_px, 512);
         let atlas = DocAtlas::try_new()?;
+        let dpr = tile_size_px as f32 / tiles::TILE_SIZE_BASE;
         Ok(Self {
             target,
             filter,
@@ -513,12 +508,81 @@ impl Surfaces {
             margins,
             dirty_surfaces: 0,
             extra_tile_dims,
-            dpr: 1.0,
+            tile_size_px,
+            dpr,
         })
     }
 
-    pub fn set_dpr(&mut self, dpr: f32) {
+    pub fn tile_size_px(&self) -> i32 {
+        self.tile_size_px
+    }
+
+    fn tile_drawable_rect(&self) -> IRect {
+        IRect {
+            left: self.margins.width,
+            top: self.margins.height,
+            right: self.margins.width + self.tile_size_px,
+            bottom: self.margins.height + self.tile_size_px,
+        }
+    }
+
+    pub fn set_view_dpr(&mut self, dpr: f32) -> Result<()> {
         self.dpr = dpr;
+        Ok(())
+    }
+
+    /// Recreate tile-sized intermediate surfaces when the *raster* tile size
+    /// changes (e.g. interactive 512 → full-quality 1024 at DPR=2). View DPR
+    /// for world tiling is unchanged — see [`tiles::get_tile_size`].
+    pub fn set_raster_tile_size(&mut self, tile_size_px: i32) -> Result<()> {
+        if tile_size_px == self.tile_size_px {
+            return Ok(());
+        }
+        self.resize_tile_surfaces(tile_size_px)
+    }
+
+    /// Legacy helper: set view DPR and full-quality raster size together.
+    pub fn set_dpr(&mut self, dpr: f32) -> Result<()> {
+        self.dpr = dpr;
+        let new_tile_px = tiles::tile_size_px_i32(dpr);
+        if new_tile_px == self.tile_size_px {
+            return Ok(());
+        }
+        self.resize_tile_surfaces(new_tile_px)
+    }
+
+    /// Recreate tile-sized intermediate surfaces and the tile atlas packer for a
+    /// new device-pixel tile size (e.g. 512 → 1024 when DPR goes to 2).
+    fn resize_tile_surfaces(&mut self, tile_size_px: i32) -> Result<()> {
+        let gpu_state = get_gpu_state();
+        let extra_tile_dims = skia::ISize::new(
+            tile_size_px * TILE_SIZE_MULTIPLIER,
+            tile_size_px * TILE_SIZE_MULTIPLIER,
+        );
+        let margins = skia::ISize::new(extra_tile_dims.width / 4, extra_tile_dims.height / 4);
+
+        self.filter = gpu_state.create_surface_with_isize("filter".to_string(), extra_tile_dims)?;
+        self.current =
+            gpu_state.create_surface_with_isize("current".to_string(), extra_tile_dims)?;
+        self.drop_shadows =
+            gpu_state.create_surface_with_isize("drop_shadows".to_string(), extra_tile_dims)?;
+        self.inner_shadows =
+            gpu_state.create_surface_with_isize("inner_shadows".to_string(), extra_tile_dims)?;
+        self.text_drop_shadows = gpu_state
+            .create_surface_with_isize("text_drop_shadows".to_string(), extra_tile_dims)?;
+        self.shape_fills =
+            gpu_state.create_surface_with_isize("shape_fills".to_string(), extra_tile_dims)?;
+        self.shape_strokes =
+            gpu_state.create_surface_with_isize("shape_strokes".to_string(), extra_tile_dims)?;
+        self.export = gpu_state.create_surface_with_isize("export".to_string(), extra_tile_dims)?;
+
+        self.extra_tile_dims = extra_tile_dims;
+        self.margins = margins;
+        self.tile_size_px = tile_size_px;
+        self.tiles = TileTextureCache::new(self.tile_atlas.width(), tile_size_px, 512);
+        self.tile_atlas_image = None;
+        self.clear_tile_atlas();
+        Ok(())
     }
 
     pub fn clear_tiles(&mut self) {
@@ -981,8 +1045,8 @@ impl Surfaces {
             .ok_or(Error::CriticalError("Failed to create surface".to_string()))?;
         self.cache.canvas().reset_matrix();
         self.cache.canvas().translate((
-            (interest_area_threshold * TILE_SIZE) as f32,
-            (interest_area_threshold * TILE_SIZE) as f32,
+            (interest_area_threshold * self.tile_size_px) as f32,
+            (interest_area_threshold * self.tile_size_px) as f32,
         ));
         Ok(())
     }
@@ -990,17 +1054,23 @@ impl Surfaces {
     pub fn resize_cache_from_viewbox(
         &mut self,
         viewbox: &Viewbox,
-        cached_viewbox: &Viewbox,
+        _cached_viewbox: &Viewbox,
         interest_area_threshold: i32,
     ) -> Result<()> {
-        let viewbox_cache_size = get_cache_size(viewbox, interest_area_threshold);
-        let cached_viewbox_cache_size = get_cache_size(cached_viewbox, interest_area_threshold);
-        // Only resize cache if the new size is larger than the cached size
-        // This avoids unnecessary surface recreations when the cache size decreases
-        if viewbox_cache_size.width > cached_viewbox_cache_size.width
-            || viewbox_cache_size.height > cached_viewbox_cache_size.height
-        {
-            return self.resize_cache(viewbox_cache_size, interest_area_threshold);
+        let needed = get_cache_size(viewbox, interest_area_threshold, self.tile_size_px);
+        let current_w = self.cache.width();
+        let current_h = self.cache.height();
+        // Grow against the *actual* GPU surface. Comparing only to
+        // `get_cache_size(cached_viewbox)` re-allocated the same (~100+ MiB)
+        // cache on every progressive zoom/pan frame while `cached_viewbox`
+        // still lagged behind a surface that had already grown.
+        let new_w = needed.width.max(current_w);
+        let new_h = needed.height.max(current_h);
+        if new_w > current_w || new_h > current_h {
+            return self.resize_cache(
+                skia::ISize::new(new_w, new_h),
+                interest_area_threshold,
+            );
         }
         Ok(())
     }
@@ -1198,7 +1268,7 @@ impl Surfaces {
         tile_doc_rect: skia::Rect,
     ) {
         let gpu_state = get_gpu_state();
-        let rect = TILE_DRAWABLE_RECT;
+        let rect = self.tile_drawable_rect();
 
         let tile_image_opt = self.current.image_snapshot_with_bounds(rect);
         if let Some(tile_image) = tile_image_opt {
@@ -1219,19 +1289,25 @@ impl Surfaces {
                 .blit_tile_image_into_atlas(gpu_state, &tile_image, tile_doc_rect);
             self.atlas.tile_doc_rects.insert(*tile, tile_doc_rect);
 
-            // Draws current tile into tile atlas
-            let tile_ref = self.tiles.add(tile_viewbox, tile);
-            self.tile_atlas.canvas().draw_image_rect(
-                &tile_image,
-                None,
-                tile_ref.rect,
-                &skia::Paint::default(),
-            );
+            // Draws current tile into tile atlas (may skip if the atlas is full —
+            // with DPR-scaled 1024px tiles a 4096² atlas only holds 16 slots).
+            if let Some(tile_ref) = self.tiles.add(tile_viewbox, tile) {
+                self.tile_atlas.canvas().draw_image_rect(
+                    &tile_image,
+                    None,
+                    tile_ref.rect,
+                    &skia::Paint::default(),
+                );
+            }
         }
     }
 
     pub fn has_cached_tile_surface(&self, tile: Tile) -> bool {
         self.tiles.has(tile)
+    }
+
+    pub fn was_rendered_without_atlas_slot(&self, tile: Tile) -> bool {
+        self.tiles.was_rendered_without_slot(tile)
     }
 
     /// Builds a 1:1 workspace-pixel snapshot for `src_doc_bounds` / `src_irect` into
@@ -1266,7 +1342,7 @@ impl Surfaces {
         let canvas = scratch.canvas();
         canvas.clear(skia::Color::TRANSPARENT);
 
-        let tile_size = tiles::get_tile_size(scale);
+        let tile_size = tiles::get_tile_size(scale, self.dpr);
         let tr = tiles::get_tiles_for_rect(src_doc_bounds, tile_size);
         let ix0 = src_irect.left as f32;
         let iy0 = src_irect.top as f32;
@@ -1275,7 +1351,7 @@ impl Surfaces {
         for ty in tr.y1()..=tr.y2() {
             for tx in tr.x1()..=tr.x2() {
                 let tile = Tile(tx, ty);
-                let tile_doc = tiles::get_tile_rect(tile, scale);
+                let tile_doc = tiles::get_tile_rect(tile, scale, self.dpr);
                 let mut clip_doc = tile_doc;
                 if !clip_doc.intersect(src_doc_bounds) || clip_doc.is_empty() {
                     continue;
@@ -1554,6 +1630,10 @@ pub struct TileTextureCache {
     textures: Vec<skia::Rect>,
     grid: HashMap<Tile, TileAtlasTextureRef>,
     removed: HashSet<Tile>,
+    /// Interest tiles drawn to cache/doc-atlas when the packed atlas had no free
+    /// slot. Used only by the pending-tile scheduler so we do not re-queue them;
+    /// `has()` stays false until they get a real atlas sprite (e.g. after pan).
+    rendered_without_slot: HashSet<Tile>,
 }
 
 pub struct AtlasDrawBatch {
@@ -1568,24 +1648,27 @@ impl AtlasDrawBatch {
 }
 
 impl TileTextureCache {
-    pub fn new(texture_size: i32, capacity: usize) -> Self {
+    pub fn new(texture_size: i32, tile_size_px: i32, capacity: usize) -> Self {
         Self {
-            tile_size: tiles::TILE_SIZE,
+            tile_size: tile_size_px as f32,
             is_updated: false,
-            provider: TileAtlasTextureProvider::new(texture_size, TILE_SIZE),
+            provider: TileAtlasTextureProvider::new(texture_size, tile_size_px),
             transforms: Vec::with_capacity(capacity),
             textures: Vec::with_capacity(capacity),
             grid: HashMap::with_capacity(capacity),
             removed: HashSet::with_capacity(capacity),
+            rendered_without_slot: HashSet::with_capacity(capacity),
         }
     }
 
     fn gc(&mut self) {
         // Make a real remove
-        for tile in self.removed.iter() {
+        let removed: Vec<Tile> = self.removed.iter().copied().collect();
+        for tile in removed.iter() {
             if let Some(tile_ref) = self.grid.remove(tile) {
                 self.provider.deallocate(tile_ref);
             }
+            self.removed.remove(tile);
         }
     }
 
@@ -1598,9 +1681,13 @@ impl TileTextureCache {
     }
 
     fn gc_non_visible(&mut self, tile_viewbox: &TileViewbox) {
+        self.gc_non_visible_limited(tile_viewbox, TEXTURES_BATCH_DELETE);
+    }
+
+    fn gc_non_visible_limited(&mut self, tile_viewbox: &TileViewbox, limit: usize) {
         let marked: Vec<_> = self
             .grid
-            .iter_mut()
+            .iter()
             .filter_map(|(tile, _)| {
                 if !tile_viewbox.is_visible(tile) {
                     Some(*tile)
@@ -1608,13 +1695,14 @@ impl TileTextureCache {
                     None
                 }
             })
-            .take(TEXTURES_BATCH_DELETE)
+            .take(limit)
             .collect();
 
         for tile in marked.iter() {
             if let Some(tile_ref) = self.grid.remove(tile) {
                 self.provider.deallocate(tile_ref);
             }
+            self.removed.remove(tile);
         }
     }
 
@@ -1638,6 +1726,14 @@ impl TileTextureCache {
         }
 
         let offset = viewbox.get_offset();
+        // Raster tiles may be smaller than device coverage (interactive LOD at
+        // HiDPI). Scale sprites so each grid cell still covers `BASE * dpr` px.
+        let device_tile = tiles::device_tile_size_px(viewbox.dpr);
+        let scale = if self.tile_size > 0.0 {
+            device_tile / self.tile_size
+        } else {
+            1.0
+        };
         let mut index = 0;
         for y in tile_viewbox.visible_rect.top()..=tile_viewbox.visible_rect.bottom() {
             for x in tile_viewbox.visible_rect.left()..=tile_viewbox.visible_rect.right() {
@@ -1651,8 +1747,8 @@ impl TileTextureCache {
                     continue;
                 }
 
-                self.transforms[index].tx = x as f32 * self.tile_size - offset.x;
-                self.transforms[index].ty = y as f32 * self.tile_size - offset.y;
+                self.transforms[index] =
+                    skia::RSXform::new(scale, 0.0, (x as f32 * device_tile - offset.x, y as f32 * device_tile - offset.y));
 
                 self.textures[index].set_ltrb(
                     tile_ref.rect.left,
@@ -1693,7 +1789,7 @@ impl TileTextureCache {
                 let doc_rect = tile_doc_rects
                     .get(&tile)
                     .copied()
-                    .unwrap_or_else(|| tiles::get_tile_rect(tile, s));
+                    .unwrap_or_else(|| tiles::get_tile_rect(tile, s, viewbox.dpr));
                 if doc_rect.is_empty() || !doc_rect.intersects(view_doc) {
                     continue;
                 }
@@ -1717,7 +1813,7 @@ impl TileTextureCache {
             let doc_rect = tile_doc_rects
                 .get(&tile)
                 .copied()
-                .unwrap_or_else(|| tiles::get_tile_rect(tile, s));
+                .unwrap_or_else(|| tiles::get_tile_rect(tile, s, viewbox.dpr));
             if doc_rect.is_empty() || !doc_rect.intersects(view_doc) {
                 continue;
             }
@@ -1740,7 +1836,29 @@ impl TileTextureCache {
         self.grid.contains_key(&tile) && !self.removed.contains(&tile)
     }
 
-    pub fn add(&mut self, tile_viewbox: &TileViewbox, tile: &Tile) -> TileAtlasTextureRef {
+    pub fn was_rendered_without_slot(&self, tile: Tile) -> bool {
+        self.rendered_without_slot.contains(&tile)
+    }
+
+    /// Allocates (or reuses) an atlas slot for `tile`. Returns `None` when the
+    /// atlas is full of visible tiles and nothing can be evicted — callers must
+    /// tolerate a miss (doc-atlas / cache surface still hold the pixels).
+    ///
+    /// With DPR-scaled tiles (1024² at DPR=2) a 4096² atlas only has 16 slots;
+    /// panicking here used to abort the whole renderer on zoom-in.
+    pub fn add(&mut self, tile_viewbox: &TileViewbox, tile: &Tile) -> Option<TileAtlasTextureRef> {
+        // Reuse an existing live slot instead of leaking one by re-inserting.
+        if let Some(existing) = self.grid.get(tile).cloned() {
+            if !self.removed.contains(tile) {
+                self.rendered_without_slot.remove(tile);
+                return Some(existing);
+            }
+            if let Some(tile_ref) = self.grid.remove(tile) {
+                self.provider.deallocate(tile_ref);
+            }
+            self.removed.remove(tile);
+        }
+
         // Evict against the real slot count (`provider.length`), not the
         // hardcoded capacity — otherwise the guard never fires and the atlas
         // fills up until `allocate()` has no slot left.
@@ -1751,18 +1869,61 @@ impl TileTextureCache {
             self.gc_non_visible(tile_viewbox);
         }
 
-        let Some(tile_ref) = self.provider.allocate() else {
-            panic!("Tile texture allocation failed {}:{}", tile.0, tile.1);
-        };
-
-        self.grid.insert(*tile, tile_ref.clone());
-
-        if self.removed.contains(tile) {
-            self.removed.remove(tile);
+        if let Some(tile_ref) = self.provider.allocate() {
+            self.grid.insert(*tile, tile_ref.clone());
+            self.rendered_without_slot.remove(tile);
+            self.is_updated = true;
+            return Some(tile_ref);
         }
 
-        self.is_updated = true;
-        tile_ref.clone()
+        // Atlas still full: force-evict every non-visible tile and retry once.
+        self.gc();
+        self.gc_non_visible_limited(tile_viewbox, usize::MAX);
+        if let Some(tile_ref) = self.provider.allocate() {
+            self.grid.insert(*tile, tile_ref.clone());
+            self.rendered_without_slot.remove(tile);
+            self.is_updated = true;
+            return Some(tile_ref);
+        }
+
+        // Visible tile and still no room: steal the farthest other visible slot.
+        if tile_viewbox.is_visible(tile) {
+            if let Some(victim) = self.farthest_visible_victim(tile_viewbox, tile) {
+                if let Some(tile_ref) = self.grid.remove(&victim) {
+                    self.provider.deallocate(tile_ref);
+                }
+                self.removed.remove(&victim);
+                self.rendered_without_slot.insert(victim);
+            }
+            if let Some(tile_ref) = self.provider.allocate() {
+                self.grid.insert(*tile, tile_ref.clone());
+                self.rendered_without_slot.remove(tile);
+                self.is_updated = true;
+                return Some(tile_ref);
+            }
+        }
+
+        // Interest (or unrecoverable): remember so the scheduler does not loop.
+        self.rendered_without_slot.insert(*tile);
+        None
+    }
+
+    fn farthest_visible_victim(
+        &self,
+        tile_viewbox: &TileViewbox,
+        keep: &Tile,
+    ) -> Option<Tile> {
+        let cx = (tile_viewbox.visible_rect.left() + tile_viewbox.visible_rect.right()) / 2;
+        let cy = (tile_viewbox.visible_rect.top() + tile_viewbox.visible_rect.bottom()) / 2;
+        self.grid
+            .keys()
+            .filter(|t| *t != keep && tile_viewbox.is_visible(t) && !self.removed.contains(t))
+            .max_by_key(|t| {
+                let dx = t.0 - cx;
+                let dy = t.1 - cy;
+                dx * dx + dy * dy
+            })
+            .copied()
     }
 
     pub fn get(&mut self, tile: Tile) -> Option<&TileAtlasTextureRef> {
@@ -1780,12 +1941,18 @@ impl TileTextureCache {
         }
         self.is_updated = true;
         self.removed.insert(tile);
+        self.rendered_without_slot.remove(&tile);
     }
 
     pub fn clear(&mut self) {
-        for k in self.grid.keys() {
-            self.removed.insert(*k);
+        // Free GPU atlas slots immediately. Only marking `removed` left slots
+        // stuck `in_use` until a later `gc`, which with DPR-scaled (few) slots
+        // quickly exhausted the packer and panicked in `add`.
+        for (_, tile_ref) in self.grid.drain() {
+            self.provider.deallocate(tile_ref);
         }
+        self.removed.clear();
+        self.rendered_without_slot.clear();
         self.is_updated = true;
     }
 }

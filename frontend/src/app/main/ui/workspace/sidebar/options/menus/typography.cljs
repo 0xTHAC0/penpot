@@ -257,13 +257,20 @@
 
     ;; FLAG :font-preview — materialize the preview sprite into the DOM only while
     ;; the picker is open (markup is prefetched on workspace load), removing it on
-    ;; close so its ~2000 nodes aren't kept around idle. Remove the flag clause to
-    ;; drop the feature.
+    ;; close so its ~2000 nodes aren't kept around idle. The attachment is deferred
+    ;; so the dropdown can paint first with plain names, then the sprite swaps in
+    ;; on the next tick. Remove the flag clause to drop the feature.
     (mf/with-effect [sprite-status]
       (when (and (contains? cf/flags :font-preview)
                  (= :ready sprite-status))
-        (let [node (fonts/attach-preview-sprite!)]
-          #(fonts/detach-preview-sprite! node))))
+        (let [node*  (volatile! nil)
+              task   (tm/schedule
+                      (fn []
+                        (vreset! node* (fonts/attach-preview-sprite!))))]
+          (fn []
+            (tm/dispose! task)
+            (when-some [n @node*]
+              (fonts/detach-preview-sprite! n))))))
 
     (mf/with-effect [@selected]
       (when-let [inst (mf/ref-val flist)]

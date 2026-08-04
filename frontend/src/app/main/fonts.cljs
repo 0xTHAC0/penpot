@@ -137,10 +137,10 @@
 ;; uploads, ones that fail to bake) use the runtime fallback.
 ;;
 ;; The sprite is heavy (~2000 nodes), so we DON'T keep it in the DOM: the fetched
-;; markup is cached here as a string (`:svg`) and the nodes are materialized only
-;; while the picker is open (attach/detach below). `:ids` are the font ids it
-;; covers, so the UI can pick sprite vs fallback.
-(defonce preview-sprite (l/atom {:status :idle :ids #{} :svg nil}))
+;; markup is cached here as a string (`:svg`) and the node is pre-parsed eagerly
+;; (`:node`) so attaching is a cheap appendChild. `:ids` are the font ids it
+;; covers (also pre-computed), so the UI can pick sprite vs fallback.
+(defonce preview-sprite (l/atom {:status :idle :ids #{} :svg nil :node nil}))
 
 ;; Id prefix shared with the generator and the UI's `<use href>`; referenced here
 ;; rather than re-declared so the contract stays in one place.
@@ -162,7 +162,7 @@
   []
   ;; :error → the UI shows plain names (no previews, no per-font load storm); a
   ;; later `prefetch-preview-sprite!` call can retry.
-  (reset! preview-sprite {:status :error :ids #{} :svg nil}))
+  (reset! preview-sprite {:status :error :ids #{} :svg nil :node nil}))
 
 (defn- parse-sprite-svg
   "Parse the cached sprite markup as SVG (not HTML, so no innerHTML injection
@@ -176,10 +176,10 @@
       root)))
 
 (defn prefetch-preview-sprite!
-  "Fetch the font-preview sprite markup and cache it in memory (no DOM yet — see
-  `attach-preview-sprite!`). Idempotent: fetches only when nothing is cached yet
-  (`:idle`) or a previous attempt failed (`:error`); no-op while `:loading` or
-  `:ready`."
+  "Fetch the font-preview sprite markup, pre-parse it, and cache both the raw
+  markup and the parsed DOM node (with collected font ids). Idempotent: fetches
+  only when nothing is cached yet (`:idle`) or a previous attempt failed
+  (`:error`); no-op while `:loading` or `:ready`."
   []
   (when (and (globals/browser?)
              (contains? #{:idle :error} (:status @preview-sprite)))
@@ -193,7 +193,20 @@
             ;; http/send! doesn't reject on non-2xx; guard so an error body isn't
             ;; cached as the sprite.
             (if (http/success? response)
-              (swap! preview-sprite assoc :status :ready :svg (:body response))
+              (let [svg    (:body response)
+                    svg-el (parse-sprite-svg svg)]
+                (if-let [node (some-> svg-el (dom/import-node))]
+                  (do
+                    (dom/set-attribute! node "id" "font-preview-sprite")
+                    (let [ids (collect-preview-ids node)]
+                      (swap! preview-sprite assoc
+                             :status :ready
+                             :svg svg
+                             :node node
+                             :ids ids)))
+                  (do
+                    (log/wrn :hint "cannot parse font preview sprite")
+                    (reset-preview-sprite-error!))))
               (do
                 (log/wrn :hint "cannot load font preview sprite" :status (:status response))
                 (reset-preview-sprite-error!))))
@@ -202,30 +215,22 @@
             (reset-preview-sprite-error!))))))
 
 (defn attach-preview-sprite!
-  "Materialize the cached sprite into the DOM (hidden) so rows can reference its
-  glyph groups via `<use>`, and record the covered font ids. Returns the injected
-  node (pass it to `detach-preview-sprite!` on close), or nil if not ready / the
-  markup is invalid. Parsing happens here, not on prefetch, so the cost is paid
-  only while the picker is open."
+  "Append the pre-parsed sprite node into the DOM (hidden) so rows can reference
+  its glyph groups via `<use>`. Returns the node (pass it to
+  `detach-preview-sprite!` on close), or nil if not ready. Parsing and id
+  collection happen once during `prefetch-preview-sprite!`, so this is just a
+  cheap appendChild."
   []
-  (let [{:keys [status svg]} @preview-sprite]
-    (when (and (globals/browser?) (= :ready status) (some? svg))
-      (if-let [node (some-> (parse-sprite-svg svg) (dom/import-node))]
-        ;; The node already carries display:none + aria-hidden from the generator.
-        (do
-          (dom/set-attribute! node "id" "font-preview-sprite")
-          (when-let [body-el (unchecked-get globals/document "body")]
-            (dom/append-child! body-el node))
-          (swap! preview-sprite assoc :ids (collect-preview-ids node))
-          node)
-        (do
-          (log/wrn :hint "cannot parse font preview sprite")
-          (reset-preview-sprite-error!)
-          nil)))))
+  (let [{:keys [status node]} @preview-sprite]
+    (when (and (globals/browser?) (= :ready status) (some? node))
+      (when-let [body-el (unchecked-get globals/document "body")]
+        (dom/append-child! body-el node))
+      node)))
 
 (defn detach-preview-sprite!
   "Remove the sprite node injected by `attach-preview-sprite!` from the DOM. The
-  cached markup and `:ids` stay, so reopening re-attaches without a refetch."
+  cached markup, parsed node, and `:ids` stay, so reopening re-attaches without
+  a refetch or re-parse."
   [node]
   (dom/remove! node))
 

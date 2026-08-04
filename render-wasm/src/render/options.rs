@@ -7,12 +7,27 @@ const SHOW_WASM_INFO: u32 = 0x08;
 // Render performance options
 // This is the extra area used for tile rendering (tiles beyond viewport).
 // Higher values pre-render more tiles, reducing empty squares during pan but using more memory.
+// Kept in *tile* units (not scaled by DPR): world tile count already matches
+// DPR=1 (`BASE/zoom`), and interactive LOD keeps raster tiles at 512 px during
+// zoom refill. Scaling interest by DPR would only inflate the cache surface.
 const VIEWPORT_INTEREST_AREA_THRESHOLD: i32 = 1;
-const MIN_DPR_VIEWPORT_INTEREST_AREA_THRESHOLD: i32 = 2;
 const MAX_BLOCKING_TIME_MS: i32 = 32;
 const NODE_BATCH_THRESHOLD: i32 = 3;
 const BLUR_DOWNSCALE_THRESHOLD: f32 = 8.0;
 const ANTIALIAS_THRESHOLD: f32 = 7.0;
+
+/// Raster resolution for tile textures relative to the view DPR.
+///
+/// Matching tile *count* at HiDPI still costs ~4× fill-rate when each tile is
+/// `512*dpr` px. Interactive quality keeps raster tiles at 512 px (DPR=1 cost)
+/// and upscales on present; Full quality uses sharp `512*dpr` tiles after settle.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub enum ContentQuality {
+    Interactive,
+    #[default]
+    Full,
+}
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct RenderOptions {
     pub flags: u32,
@@ -23,6 +38,8 @@ pub struct RenderOptions {
     /// keeps per-frame flushing enabled (unlike pan/zoom, where
     /// `render_from_cache` drives target presentation).
     interactive_transform: bool,
+    /// Tile raster LOD — see [`ContentQuality`].
+    content_quality: ContentQuality,
     /// Minimum on-screen size (CSS px at 1:1 zoom) above which vector antialiasing is enabled.
     pub antialias_threshold: f32,
     pub viewport_interest_area_threshold: i32,
@@ -40,6 +57,7 @@ impl Default for RenderOptions {
             dpr: 1.0,
             fast_mode: false,
             interactive_transform: false,
+            content_quality: ContentQuality::Full,
             antialias_threshold: ANTIALIAS_THRESHOLD,
             viewport_interest_area_threshold: VIEWPORT_INTEREST_AREA_THRESHOLD,
             dpr_viewport_interest_area_threshold: VIEWPORT_INTEREST_AREA_THRESHOLD,
@@ -69,19 +87,45 @@ impl RenderOptions {
         self.fast_mode = enabled;
     }
 
+    pub fn content_quality(&self) -> ContentQuality {
+        self.content_quality
+    }
+
+    /// Returns `true` when the quality value changed.
+    pub fn set_content_quality(&mut self, quality: ContentQuality) -> bool {
+        if self.content_quality != quality {
+            self.content_quality = quality;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Device-pixel size used to *rasterize* each tile at the current quality.
+    /// Interactive quality stays at 512 px even when view DPR is 2 so fill-rate
+    /// matches DPR=1 during pan/zoom; Full quality uses `512 * dpr`.
+    pub fn raster_tile_size_px(&self) -> i32 {
+        match self.content_quality {
+            ContentQuality::Interactive if self.dpr > 1.05 => crate::tiles::TILE_SIZE_BASE as i32,
+            _ => crate::tiles::tile_size_px_i32(self.dpr),
+        }
+    }
+
+    pub fn needs_full_quality_upgrade(&self) -> bool {
+        self.content_quality == ContentQuality::Interactive && self.dpr > 1.05
+    }
+
     #[cfg(target_arch = "wasm32")]
     pub fn set_capture_frames(&mut self, capture_frames: i32) {
         self.capture_frames = capture_frames;
     }
 
-    /// Updates the dpr viewport interest area threshold.
-    /// This function is updated when the dpr or the
-    /// viewport_interest_area_threshold is changed
+    /// Syncs `dpr_viewport_interest_area_threshold` with the configured
+    /// tile-ring size. Interest is intentionally **not** multiplied by DPR:
+    /// tile textures already scale with DPR, so a 1-tile ring keeps the same
+    /// device-pixel margin as DPR=1.
     fn update_dpr_viewport_interest_area_threshold(&mut self) {
-        // TODO: this will likely need to change once we have the tile atlas in place
-        self.dpr_viewport_interest_area_threshold =
-            ((self.dpr * self.viewport_interest_area_threshold as f32).ceil() as i32)
-                .min(MIN_DPR_VIEWPORT_INTEREST_AREA_THRESHOLD);
+        self.dpr_viewport_interest_area_threshold = self.viewport_interest_area_threshold;
     }
 
     /// Sets the devicePixelRatio.

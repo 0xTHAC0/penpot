@@ -339,6 +339,8 @@ pub extern "C" fn set_view_start() -> Result<()> {
         VIEW_INTERACTION_START = performance::get_time();
     }
     performance::begin_measure!("set_view_start");
+    // Keep existing tile textures for `render_from_cache` during the gesture.
+    // Quality LOD is applied on `set_view_end` when a zoom forces a refill.
     get_render_state().options.set_fast_mode(true);
     performance::end_measure!("set_view_start");
     Ok(())
@@ -366,6 +368,10 @@ pub extern "C" fn set_view_end() -> Result<()> {
             // index and clear the tile texture cache, but *preserve*
             // the cache canvas so render_from_cache can show a scaled
             // preview of the old content while new tiles render.
+            //
+            // At HiDPI, refill first at interactive (512 px) quality so
+            // progressive fill-rate matches DPR=1, then promote to sharp.
+            render_state.enter_interactive_content_quality()?;
             render_state.rebuild_tile_index(&state.shapes);
             render_state.surfaces.invalidate_tile_cache();
         } else {

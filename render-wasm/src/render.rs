@@ -22,7 +22,7 @@ use skia_safe::{self as skia, Matrix, RRect, Rect};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use options::RenderOptions;
+use options::{ContentQuality, RenderOptions};
 pub use surfaces::{SurfaceId, Surfaces};
 
 use crate::error::{Error, Result};
@@ -45,6 +45,7 @@ pub(crate) use resources::RenderResources;
 type ClipStack = Vec<(Rect, Option<Corners>, Matrix)>;
 
 #[repr(u8)]
+#[derive(Clone, Copy, Debug)]
 pub enum FrameType {
     None = 0,
     Partial = 1,
@@ -427,13 +428,18 @@ pub struct InteractiveDragCrop {
     pub image: skia::Image,
 }
 
-/// Chooses a window inside the full workspace-pixel crop `[0, out_w) × [0, out_h)` with each side
-/// at most `max_side_px` (**without scaling**): centered on the projection of
-/// `viewport_doc ∩ src_doc_bounds`, or on the full crop if that intersection is empty.
-/// `max_side_px` should match [`GpuState::max_texture_size`] (same budget as the atlas).
+/// Chooses a window inside the full workspace-pixel crop `[0, out_w) × [0, out_h)`
+/// with width/height at most `max_w_px` / `max_h_px` (**without scaling**): centered on
+/// the projection of `viewport_doc ∩ src_doc_bounds`, or on the full crop if that
+/// intersection is empty.
+///
+/// Caps should match the backbuffer (viewport) size so the common path can
+/// `snapshot_rect` from Backbuffer instead of allocating a max-texture scratch
+/// and snapshotting the document atlas.
 #[allow(clippy::too_many_arguments)]
 fn drag_crop_snapshot_window_px(
-    max_side_px: i32,
+    max_w_px: i32,
+    max_h_px: i32,
     out_w: i32,
     out_h: i32,
     viewport_doc: Rect,
@@ -444,12 +450,13 @@ fn drag_crop_snapshot_window_px(
     src_top_px: i32,
     src_doc_bounds: Rect,
 ) -> (i32, i32, i32, i32) {
-    let cap = max_side_px.max(1);
-    if out_w <= cap && out_h <= cap {
+    let cap_w = max_w_px.max(1);
+    let cap_h = max_h_px.max(1);
+    if out_w <= cap_w && out_h <= cap_h {
         return (0, 0, out_w, out_h);
     }
-    let win_w = out_w.min(cap);
-    let win_h = out_h.min(cap);
+    let win_w = out_w.min(cap_w);
+    let win_h = out_h.min(cap_h);
 
     let mut vis = viewport_doc;
     let has_vis = vis.intersect(src_doc_bounds);
@@ -551,7 +558,7 @@ impl RenderState {
         let surfaces = Surfaces::try_new(
             (width, height),
             sampling_options,
-            tiles::get_tile_dimensions(),
+            tiles::get_tile_dimensions(1.0),
         )?;
 
         Self::assemble(width, height, surfaces)
@@ -702,7 +709,7 @@ impl RenderState {
             None => return,
         };
 
-        let scale = self.get_scale();
+        let scale = self.get_raster_scale();
         let scaled_sigma = radius_to_sigma(blur.value * scale);
         // Cap sigma so the blur kernel (≈3σ) stays within the tile margin.
         // This prevents visible seams at tile boundaries when zoomed in.
@@ -873,15 +880,71 @@ impl RenderState {
         if self.options.set_dpr(dpr) {
             self.tile_viewbox
                 .set_interest(self.options.dpr_viewport_interest_area_threshold);
+            get_resources().fonts.set_scale_debug_font(dpr);
+            self.viewbox.set_dpr(dpr);
+            self.cached_viewbox.set_dpr(dpr);
+            // Recreate tile-sized surfaces for the current content quality
+            // (interactive = 512 px, full = 512*dpr) before resizing targets.
+            self.surfaces.set_view_dpr(dpr)?;
+            self.surfaces
+                .set_raster_tile_size(self.options.raster_tile_size_px())?;
             self.resize(
                 self.viewbox.width().floor() as i32,
                 self.viewbox.height().floor() as i32,
             )?;
-            get_resources().fonts.set_scale_debug_font(dpr);
-            self.viewbox.set_dpr(dpr);
-            self.surfaces.set_dpr(dpr);
+            // Tile grid world size is BASE/zoom (stable across DPR); still
+            // drop the shape→tile index so the next render rebuilds it.
+            self.tiles.invalidate();
+            self.tile_viewbox.update(&self.viewbox);
         }
         Ok(())
+    }
+
+    /// Drop to interactive (512 px) tile raster when view DPR > 1 so zoom
+    /// refill fill-rate matches DPR=1. No-op when already interactive or at DPR≈1.
+    pub fn enter_interactive_content_quality(&mut self) -> Result<()> {
+        if self.options.dpr <= 1.05 {
+            return Ok(());
+        }
+        if !self
+            .options
+            .set_content_quality(ContentQuality::Interactive)
+        {
+            return Ok(());
+        }
+        self.surfaces
+            .set_raster_tile_size(self.options.raster_tile_size_px())?;
+        self.surfaces.invalidate_tile_cache();
+        Ok(())
+    }
+
+    /// Promote to full-DPR tile textures after an interactive settle. Returns
+    /// `true` when a new progressive pass is required.
+    pub fn try_begin_full_quality_pass(&mut self, _tree: ShapesPoolRef) -> Result<bool> {
+        if !self.options.needs_full_quality_upgrade() {
+            return Ok(false);
+        }
+        self.options.set_content_quality(ContentQuality::Full);
+        self.surfaces
+            .set_raster_tile_size(self.options.raster_tile_size_px())?;
+        self.surfaces.invalidate_tile_cache();
+        // Fresh tile surfaces need the tile-raster CTM (see get_raster_scale).
+        let scale = self.get_raster_scale();
+        let surface_ids = SurfaceId::Strokes as u32
+            | SurfaceId::Fills as u32
+            | SurfaceId::InnerShadows as u32
+            | SurfaceId::TextDropShadows as u32;
+        self.surfaces.apply_mut(surface_ids, |s| {
+            s.canvas().scale((scale, scale));
+        });
+        self.tile_viewbox.update(&self.viewbox);
+        self.pending_tiles
+            .update(&self.tile_viewbox, &self.surfaces, false);
+        self.current_tile = None;
+        self.pending_nodes.clear();
+        self.cache_cleared_this_render = false;
+        self.preserve_target_during_render = true;
+        Ok(true)
     }
 
     pub fn set_antialias_threshold(&mut self, value: f32) {
@@ -1055,7 +1118,7 @@ impl RenderState {
         // (snapshot -> atlas blit -> tiles.add) can force GPU stalls. Defer cache rebuild until
         // the interaction ends.
         if self.options.is_interactive_transform() {
-            let tile_rect = self.get_current_aligned_tile_bounds()?;
+            let tile_rect = self.get_current_device_aligned_tile_bounds()?;
             self.surfaces.draw_current_tile_into_backbuffer(
                 &tile_rect,
                 self.background_color,
@@ -1319,7 +1382,7 @@ impl RenderState {
             && target_surface != SurfaceId::Export;
 
         if can_render_directly {
-            let scale = self.get_scale();
+            let scale = self.get_raster_scale();
             let translation = self
                 .surfaces
                 .get_render_context_translation(self.render_area, scale);
@@ -1362,7 +1425,7 @@ impl RenderState {
 
         // set clipping
         if let Some(clips) = clip_bounds.as_ref() {
-            let scale = self.get_scale();
+            let scale = self.get_raster_scale();
             for (mut bounds, corners, transform) in clips.iter() {
                 self.surfaces.apply_mut(surface_ids, |s| {
                     s.canvas().concat(transform);
@@ -1513,7 +1576,7 @@ impl RenderState {
                     rebound_text_content.as_ref().unwrap_or(stored_text_content);
                 let count_inner_strokes = shape.count_visible_inner_strokes();
                 // Erode the main text fill by 1px when there are inner strokes, to avoid a visible seam at the glyph edge.
-                let text_fill_inset = (count_inner_strokes > 0).then(|| 1.0 / self.get_scale());
+                let text_fill_inset = (count_inner_strokes > 0).then(|| 1.0 / self.get_raster_scale());
                 let text_stroke_blur_outset =
                     Stroke::max_bounds_width(shape.visible_strokes(), false);
                 let mut paragraph_builders = text_content.paragraph_builder_group_from_text(None);
@@ -1915,18 +1978,20 @@ impl RenderState {
 
     pub fn update_render_context(&mut self, tile: tiles::Tile) {
         self.current_tile = Some(tile);
-        let scale = self.get_scale();
-        self.render_area = tiles::get_tile_rect(tile, scale);
+        let view_scale = self.get_scale();
+        let raster_scale = self.get_raster_scale();
+        self.render_area = tiles::get_tile_rect(tile, view_scale, self.viewbox.dpr);
         let margins = self.surfaces.margins();
-        let margin_w = margins.width as f32 / scale;
-        let margin_h = margins.height as f32 / scale;
+        let margin_w = margins.width as f32 / raster_scale;
+        let margin_h = margins.height as f32 / raster_scale;
         self.render_area_with_margins = skia::Rect::from_ltrb(
             self.render_area.left - margin_w,
             self.render_area.top - margin_h,
             self.render_area.right + margin_w,
             self.render_area.bottom + margin_h,
         );
-        self.surfaces.update_render_context(self.render_area, scale);
+        self.surfaces
+            .update_render_context(self.render_area, raster_scale);
     }
 
     fn rebuild_backbuffer_crop_cache(&mut self, tree: ShapesPoolRef) {
@@ -2005,19 +2070,22 @@ impl RenderState {
             })
             .collect();
 
+        if non_overlapping.is_empty() {
+            return;
+        }
+
         let vb_left = self.viewbox.area.left;
         let vb_top = self.viewbox.area.top;
         let (bb_w, bb_h) = self.surfaces.surface_size(SurfaceId::Backbuffer);
-        let max_snap_px = get_gpu_state().max_texture_size();
+        let max_tex = get_gpu_state().max_texture_size();
+        // Prefer viewport-sized crops so we can snapshot from Backbuffer (cheap)
+        // instead of allocating up to max_texture scratch + doc-atlas snapshot.
+        let max_w_px = bb_w.min(max_tex).max(1);
+        let max_h_px = bb_h.min(max_tex).max(1);
 
-        // Snapshot the atlas once for the whole pass so that all shapes sharing
-        // the tile/atlas fallback path reuse the same GPU image rather than each
-        // triggering a separate `image_snapshot` flush.
-        let atlas_snap = self.surfaces.atlas.snapshot_for_drag_crop();
-
-        // Scratch surface reused across all shapes that need the tile/atlas
-        // fallback — avoids one WebGL texture allocation per shape.
-        // Created lazily on first use and grown if a later shape needs more space.
+        // Lazily snapshot the doc atlas only if a shape falls outside the
+        // backbuffer and needs the tile/atlas fallback path.
+        let mut atlas_snap: Option<(skia::Image, f32, skia::Point)> = None;
         let mut scratch_surface: Option<skia::Surface> = None;
 
         for (id, doc_bounds, selrect) in non_overlapping {
@@ -2040,7 +2108,8 @@ impl RenderState {
             let full_w = src_irect.width();
             let full_h = src_irect.height();
             let (win_ox, win_oy, win_w, win_h) = drag_crop_snapshot_window_px(
-                max_snap_px,
+                max_w_px,
+                max_h_px,
                 full_w,
                 full_h,
                 viewport,
@@ -2080,6 +2149,9 @@ impl RenderState {
             let image = if let Some(img) = backbuffer_snap {
                 img
             } else {
+                if atlas_snap.is_none() {
+                    atlas_snap = self.surfaces.atlas.snapshot_for_drag_crop();
+                }
                 // Ensure the scratch surface is large enough for this window.
                 // Grow (reallocate) only when necessary so that the common case
                 // of similarly-sized shapes pays zero extra allocation cost.
@@ -2137,7 +2209,6 @@ impl RenderState {
             self.background_color,
         );
         self.present_frame(shapes);
-
         performance::end_measure!("render_from_cache");
         performance::end_timed_log!("render_from_cache", _start);
     }
@@ -2202,7 +2273,7 @@ impl RenderState {
         self.clear(tree);
 
         let _start = performance::begin_timed_log!("start_render_loop");
-        let scale = self.get_scale();
+        let raster_scale = self.get_raster_scale();
 
         self.tile_viewbox.update(&self.viewbox);
         self.focus_mode.reset();
@@ -2261,7 +2332,7 @@ impl RenderState {
             | SurfaceId::TextDropShadows as u32;
 
         self.surfaces.apply_mut(surface_ids, |s| {
-            s.canvas().scale((scale, scale));
+            s.canvas().scale((raster_scale, raster_scale));
         });
 
         self.surfaces.resize_cache_from_viewbox(
@@ -2276,7 +2347,8 @@ impl RenderState {
         let _tile_start = performance::begin_timed_log!("tile_cache_update");
 
         performance::begin_measure!("tile_cache");
-        let only_visible = self.options.is_interactive_transform();
+        let only_visible = self.options.is_interactive_transform()
+            || self.options.content_quality() == ContentQuality::Interactive;
         self.pending_tiles
             .update(&self.tile_viewbox, &self.surfaces, only_visible);
         performance::end_measure!("tile_cache");
@@ -2290,10 +2362,16 @@ impl RenderState {
         if sync_render {
             frame_type = self.render_shape_tree_sync(base_object, tree, timestamp)?;
         } else {
-            // Keep progressive yielding, except for a localized shape edit on a
-            // stable viewbox (e.g. recoloring) which renders in one frame.
-            let allow_stop =
-                !preserve_target || self.zoom_changed() || self.options.is_interactive_transform();
+            // Always allow progressive yielding. `preserve_target` keeps the last
+            // presented frame visible while tiles fill in (pan-end, zoom-end, and
+            // localized shape edits via `rebuild_touched_tiles`).
+            //
+            // Previously `allow_stop` was false when `preserve_target && !zoom_changed`
+            // (intended to finish localized recolors in one frame). After pan that
+            // forced a synchronous pass over the whole interest area and blocked the
+            // browser for 1–2s at HiDPI deep zoom (DPR=2). Localized edits still
+            // finish in one frame when little work remains within max_blocking_time.
+            let allow_stop = true;
             frame_type = self.continue_render_loop(base_object, tree, timestamp, allow_stop)?;
 
             // This is an option to debug frames.
@@ -2312,7 +2390,6 @@ impl RenderState {
                 self.cached_viewbox = self.viewbox;
             }
         }
-
         performance::end_measure!("start_render_loop");
         performance::end_timed_log!("start_render_loop", _start);
         Ok(frame_type)
@@ -2364,11 +2441,25 @@ impl RenderState {
         // presented (only flushed), so defer composition to the final frame and
         // avoid re-snapshotting up to 4096² on every rAF during async tile work.
         if !self.options.is_interactive_transform() && matches!(frame_type, FrameType::Full) {
-            self.surfaces.draw_tile_atlas_to_backbuffer(
+            // Doc-scaled placement handles interactive LOD (512 → device) correctly.
+            self.surfaces.draw_combined_atlas_to_backbuffer(
                 &self.viewbox,
                 &self.tile_viewbox,
                 self.background_color,
             );
+
+            // HiDPI settle: show the fast 512 px pass, then promote to sharp
+            // 512*dpr tiles without notifying "complete" yet.
+            if self.options.needs_full_quality_upgrade() {
+                if !self.options.is_fast_mode() {
+                    self.rebuild_backbuffer_crop_cache(tree);
+                }
+                self.present_frame(tree);
+                self.try_begin_full_quality_pass(tree)?;
+                self.flush();
+                performance::end_measure!("continue_render_loop");
+                return Ok(FrameType::Partial);
+            }
         }
 
         match frame_type {
@@ -2527,10 +2618,10 @@ impl RenderState {
         // Restore render-surface transforms for the workspace context.
         // If we have a current tile, restore its tile render context; otherwise
         // fall back to restoring the previous render_area (may be empty).
-        let workspace_scale = self.get_scale();
         if let Some(tile) = self.current_tile {
             self.update_render_context(tile);
         } else if !self.render_area.is_empty() {
+            let workspace_scale = self.get_raster_scale();
             self.surfaces
                 .update_render_context(self.render_area, workspace_scale);
         }
@@ -2626,10 +2717,10 @@ impl RenderState {
                 if mask_group_blur {
                     self.surfaces.canvas(target_surface).save();
                     if let Some(clips) = clip_bounds {
-                        let scale = self.get_scale();
+                        let scale = self.get_raster_scale();
                         let antialias = !self.options.is_fast_mode()
                             && element
-                                .should_use_antialias(scale, self.options.antialias_threshold);
+                                .should_use_antialias(self.get_scale(), self.options.antialias_threshold);
                         self.clip_target_surface_to_stack(clips, target_surface, scale, antialias);
                     }
                 }
@@ -2637,7 +2728,7 @@ impl RenderState {
                 let mut paint = skia::Paint::default();
                 if !self.options.is_fast_mode() {
                     if let Some(blur) = element.masked_group_layer_blur() {
-                        let scale = self.get_scale();
+                        let scale = self.get_raster_scale();
                         let sigma = radius_to_sigma(blur.value * scale);
                         if let Some(filter) =
                             skia::image_filters::blur((sigma, sigma), None, None, None)
@@ -2814,7 +2905,9 @@ impl RenderState {
             .current_tile
             .ok_or(Error::CriticalError("Current tile not found".to_string()))?;
         let offset = self.viewbox.get_offset();
-        Ok(tile.get_rect_with_offset(&offset))
+        // Backbuffer placement uses device coverage (may be larger than raster).
+        let tile_px = tiles::device_tile_size_px(self.viewbox.dpr);
+        Ok(tile.get_rect_with_offset(&offset, tile_px))
     }
 
     pub fn get_rect_bounds(&mut self, rect: skia::Rect) -> Rect {
@@ -2840,30 +2933,51 @@ impl RenderState {
         self.get_rect_bounds(rect)
     }
 
+    /// Tile bounds in *raster* / cache surface coordinates (`surfaces.tile_size_px`).
+    /// Grid indices follow world tiling (`BASE/zoom`); raster cells may be smaller
+    /// than device coverage when interactive LOD is active.
     pub fn get_aligned_tile_bounds(&mut self, tile: tiles::Tile) -> Rect {
         let scale = self.get_scale();
-        let start_tile_x =
-            (self.viewbox.area.left * scale / tiles::TILE_SIZE).floor() * tiles::TILE_SIZE;
-        let start_tile_y =
-            (self.viewbox.area.top * scale / tiles::TILE_SIZE).floor() * tiles::TILE_SIZE;
+        let raster_px = self.surfaces.tile_size_px() as f32;
+        let device_px = tiles::device_tile_size_px(self.viewbox.dpr);
+        // Origin tile index from device/world grid (stable across LOD).
+        let start_idx_x = (self.viewbox.area.left * scale / device_px).floor();
+        let start_idx_y = (self.viewbox.area.top * scale / device_px).floor();
         Rect::from_xywh(
-            (tile.x() as f32 * tiles::TILE_SIZE) - start_tile_x,
-            (tile.y() as f32 * tiles::TILE_SIZE) - start_tile_y,
-            tiles::TILE_SIZE,
-            tiles::TILE_SIZE,
+            (tile.x() as f32 - start_idx_x) * raster_px,
+            (tile.y() as f32 - start_idx_y) * raster_px,
+            raster_px,
+            raster_px,
+        )
+    }
+
+    /// Tile bounds on the backbuffer using device coverage (`BASE * view_dpr`).
+    pub fn get_device_aligned_tile_bounds(&mut self, tile: tiles::Tile) -> Rect {
+        let scale = self.get_scale();
+        let tile_px = tiles::device_tile_size_px(self.viewbox.dpr);
+        let start_tile_x =
+            (self.viewbox.area.left * scale / tile_px).floor() * tile_px;
+        let start_tile_y =
+            (self.viewbox.area.top * scale / tile_px).floor() * tile_px;
+        Rect::from_xywh(
+            (tile.x() as f32 * tile_px) - start_tile_x,
+            (tile.y() as f32 * tile_px) - start_tile_y,
+            tile_px,
+            tile_px,
         )
     }
 
     // Returns the bounds of the current tile relative to the viewbox,
-    // aligned to the nearest tile grid origin.
-    //
-    // Unlike `get_current_tile_bounds`, which calculates bounds using the exact
-    // scaled offset of the viewbox, this method snaps the origin to the nearest
-    // lower multiple of `TILE_SIZE`. This ensures the tile bounds are aligned
-    // with the global tile grid, which is useful for rendering tiles in a
-    /// consistent and predictable layout.
+    // aligned to the nearest tile grid origin (raster / cache coordinates).
     pub fn get_current_aligned_tile_bounds(&mut self) -> Result<Rect> {
         Ok(self.get_aligned_tile_bounds(
+            self.current_tile
+                .ok_or(Error::CriticalError("Current tile not found".to_string()))?,
+        ))
+    }
+
+    pub fn get_current_device_aligned_tile_bounds(&mut self) -> Result<Rect> {
+        Ok(self.get_device_aligned_tile_bounds(
             self.current_tile
                 .ok_or(Error::CriticalError("Current tile not found".to_string()))?,
         ))
@@ -3296,7 +3410,7 @@ impl RenderState {
                 // Skip it for this pass; a subsequent render will pick it up once present.
                 continue;
             };
-            let scale = self.get_scale();
+            let scale = self.get_raster_scale();
             let mut extrect: Option<Rect> = None;
 
             // If the shape is not in the tile set, then we add them.
@@ -3403,7 +3517,7 @@ impl RenderState {
                             ),
                             None => (0.0, 0.0),
                         };
-                        let scale = self.get_scale();
+                        let scale = self.get_raster_scale();
                         let translation = self
                             .surfaces
                             .get_render_context_translation(self.render_area, scale);
@@ -3671,7 +3785,9 @@ impl RenderState {
                     if !is_empty || self.current_tile_had_shapes {
                         if self.options.is_interactive_transform() {
                             // During drag, avoid snapshot-based caching. Draw Current directly
-                            // into Target (and Cache) to reduce stalls.
+                            // into Target (and Cache) to reduce stalls. Device bounds so LQ
+                            // tiles upscale onto the HiDPI backbuffer.
+                            let tile_rect = self.get_current_device_aligned_tile_bounds()?;
                             self.surfaces.draw_current_tile_into_backbuffer(
                                 &tile_rect,
                                 self.background_color,
@@ -3801,7 +3917,7 @@ impl RenderState {
     pub fn get_tiles_for_shape(&mut self, shape: &Shape, tree: ShapesPoolRef) -> TileRect {
         let scale = self.get_scale();
         let extrect = self.get_cached_extrect(shape, tree, scale);
-        let tile_size = tiles::get_tile_size(scale);
+        let tile_size = tiles::get_tile_size(scale, self.viewbox.dpr);
         let shape_tiles = tiles::get_tiles_for_rect(extrect, tile_size);
         let interest_rect = &self.tile_viewbox.interest_rect;
         // Calculate the intersection of shape_tiles with interest_rect
@@ -4121,6 +4237,22 @@ impl RenderState {
             return export_scale;
         }
         self.viewbox.get_scale()
+    }
+
+    /// Doc→pixel scale for *tile raster* surfaces (Current/Fills/…).
+    ///
+    /// At full quality this equals [`Self::get_scale`] (`zoom * dpr`). During
+    /// interactive HiDPI LOD, tile textures are only `BASE` px wide so the CTM
+    /// must be `zoom` — otherwise shapes are drawn 2× too large into the tile
+    /// and the soft settle pass looks oversized until the sharp pass replaces it.
+    pub fn get_raster_scale(&self) -> f32 {
+        if let Some((_, export_scale)) = self.export_context {
+            return export_scale;
+        }
+        let raster = self.surfaces.tile_size_px() as f32;
+        let world_tile =
+            tiles::get_tile_size(self.viewbox.get_scale(), self.viewbox.dpr).max(1e-6);
+        raster / world_tile
     }
 
     pub fn zoom_changed(&self) -> bool {

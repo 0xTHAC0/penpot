@@ -22,7 +22,7 @@ use skia_safe::{self as skia, Matrix, RRect, Rect};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use options::RenderOptions;
+use options::{ContentQuality, RenderOptions};
 pub use surfaces::{SurfaceId, Surfaces};
 
 use crate::error::{Error, Result};
@@ -416,6 +416,14 @@ pub(crate) struct RenderState {
     pub tile_atlas_flushed: bool,
     /// Multi-tile paint-once into Current, then crop to atlas slots.
     paint_region: Option<PaintRegion>,
+    /// After soft (DPR≤1 fill-rate) settle, refill sharp tiles one-by-one at
+    /// full view DPR. Paint-once is disabled until this pass finishes.
+    sharp_tile_refill: bool,
+    /// Soft settle presented; begin sharp refill on the *next* continue so the
+    /// browser gets a frame to stay responsive before per-tile HiDPI work.
+    pending_sharp_promote: bool,
+    /// True after soft settle presented Target; cleared when Full-quality pass starts.
+    viewport_presented: bool,
 }
 
 /// Active paint-once region (visible viewport tiles or interest ring).
@@ -436,13 +444,18 @@ pub struct InteractiveDragCrop {
     pub image: skia::Image,
 }
 
-/// Chooses a window inside the full workspace-pixel crop `[0, out_w) × [0, out_h)` with each side
-/// at most `max_side_px` (**without scaling**): centered on the projection of
-/// `viewport_doc ∩ src_doc_bounds`, or on the full crop if that intersection is empty.
-/// `max_side_px` should match [`GpuState::max_texture_size`] (same budget as the atlas).
+/// Chooses a window inside the full workspace-pixel crop `[0, out_w) × [0, out_h)`
+/// with width/height at most `max_w_px` / `max_h_px` (**without scaling**): centered on
+/// the projection of `viewport_doc ∩ src_doc_bounds`, or on the full crop if that
+/// intersection is empty.
+///
+/// Caps should match the backbuffer (viewport) size so the common path can
+/// `snapshot_rect` from Backbuffer instead of allocating a max-texture scratch
+/// and snapshotting the document atlas.
 #[allow(clippy::too_many_arguments)]
 fn drag_crop_snapshot_window_px(
-    max_side_px: i32,
+    max_w_px: i32,
+    max_h_px: i32,
     out_w: i32,
     out_h: i32,
     viewport_doc: Rect,
@@ -453,12 +466,13 @@ fn drag_crop_snapshot_window_px(
     src_top_px: i32,
     src_doc_bounds: Rect,
 ) -> (i32, i32, i32, i32) {
-    let cap = max_side_px.max(1);
-    if out_w <= cap && out_h <= cap {
+    let cap_w = max_w_px.max(1);
+    let cap_h = max_h_px.max(1);
+    if out_w <= cap_w && out_h <= cap_h {
         return (0, 0, out_w, out_h);
     }
-    let win_w = out_w.min(cap);
-    let win_h = out_h.min(cap);
+    let win_w = out_w.min(cap_w);
+    let win_h = out_h.min(cap_h);
 
     let mut vis = viewport_doc;
     let has_vis = vis.intersect(src_doc_bounds);
@@ -560,7 +574,7 @@ impl RenderState {
         let surfaces = Surfaces::try_new(
             (width, height),
             sampling_options,
-            tiles::get_tile_dimensions(),
+            tiles::get_tile_dimensions(1.0),
             RenderOptions::default().dpr_viewport_interest_area_threshold,
         )?;
 
@@ -607,6 +621,9 @@ impl RenderState {
             backbuffer_crop_cache: HashMap::default(),
             tile_atlas_flushed: false,
             paint_region: None,
+            sharp_tile_refill: false,
+            pending_sharp_promote: false,
+            viewport_presented: false,
         })
     }
 
@@ -884,15 +901,81 @@ impl RenderState {
         if self.options.set_dpr(dpr) {
             self.tile_viewbox
                 .set_interest(self.options.dpr_viewport_interest_area_threshold);
+            get_resources().fonts.set_scale_debug_font(dpr);
+            self.viewbox.set_dpr(dpr);
+            self.cached_viewbox.set_dpr(dpr);
+            self.surfaces.set_view_dpr(dpr)?;
+            self.surfaces
+                .set_raster_tile_size(self.options.raster_tile_size_px())?;
             self.resize(
                 self.viewbox.width().floor() as i32,
                 self.viewbox.height().floor() as i32,
             )?;
-            get_resources().fonts.set_scale_debug_font(dpr);
-            self.viewbox.set_dpr(dpr);
-            self.surfaces.set_dpr(dpr);
+            self.tiles.invalidate();
+            self.tile_viewbox.update(&self.viewbox);
+            // First paint at DPR>1 should be the soft (DPR≤1 fill-rate) pass.
+            self.enter_interactive_content_quality()?;
         }
         Ok(())
+    }
+
+    /// Drop to interactive (512 px) tile raster when view DPR > 1 so zoom
+    /// refill fill-rate matches DPR=1. No-op when already interactive or at DPR≈1.
+    pub fn enter_interactive_content_quality(&mut self) -> Result<()> {
+        if self.options.dpr <= 1.05 {
+            return Ok(());
+        }
+        if !self
+            .options
+            .set_content_quality(ContentQuality::Interactive)
+        {
+            return Ok(());
+        }
+        self.surfaces
+            .set_raster_tile_size(self.options.raster_tile_size_px())?;
+        self.surfaces.invalidate_tile_cache();
+        self.sharp_tile_refill = false;
+        self.pending_sharp_promote = false;
+        self.paint_region = None;
+        Ok(())
+    }
+
+    /// Promote to full-DPR tile textures after soft settle. Returns `true` when
+    /// a progressive pass is required.
+    ///
+    /// Soft settle already did one paint-once of the viewport at DPR≤1 fill-rate.
+    /// This pass requeues **visible + interest** at the real view DPR and allows
+    /// paint-once again when the region fits Current.
+    pub fn try_begin_full_quality_pass(&mut self, _tree: ShapesPoolRef) -> Result<bool> {
+        if !self.options.needs_full_quality_upgrade() {
+            return Ok(false);
+        }
+        self.options.set_content_quality(ContentQuality::Full);
+        self.surfaces
+            .set_raster_tile_size(self.options.raster_tile_size_px())?;
+        self.surfaces.invalidate_tile_cache();
+        let scale = self.get_raster_scale();
+        let surface_ids = SurfaceId::Strokes as u32
+            | SurfaceId::Fills as u32
+            | SurfaceId::InnerShadows as u32
+            | SurfaceId::TextDropShadows as u32;
+        self.surfaces.apply_mut(surface_ids, |s| {
+            s.canvas().scale((scale, scale));
+        });
+        self.tile_viewbox.update(&self.viewbox);
+        // Visible + interest at full DPR (soft settle was visible-only).
+        self.pending_tiles
+            .update(&self.tile_viewbox, &self.surfaces, false);
+        self.current_tile = None;
+        self.pending_nodes.clear();
+        self.paint_region = None;
+        self.cache_cleared_this_render = false;
+        self.preserve_target_during_render = true;
+        self.viewport_presented = false;
+        // Allow paint-once of the pending set when it fits; otherwise per-tile.
+        self.sharp_tile_refill = false;
+        self.pending_sharp_promote = false;
+        Ok(true)
     }
 
     pub fn set_antialias_threshold(&mut self, value: f32) {
@@ -1342,15 +1425,15 @@ impl RenderState {
             && target_surface != SurfaceId::Export;
 
         if can_render_directly {
-            let scale = self.get_scale();
+            let paint_scale = self.get_paint_scale();
             let translation = self
                 .surfaces
-                .get_render_context_translation(self.render_area, scale);
+                .get_render_context_translation(self.render_area, paint_scale);
 
             self.surfaces.apply_mut(target_surface as u32, |s| {
                 let canvas = s.canvas();
                 canvas.save();
-                canvas.scale((scale, scale));
+                canvas.scale((paint_scale, paint_scale));
                 canvas.translate(translation);
             });
 
@@ -1938,18 +2021,20 @@ impl RenderState {
 
     pub fn update_render_context(&mut self, tile: tiles::Tile) {
         self.current_tile = Some(tile);
-        let scale = self.get_scale();
-        self.render_area = tiles::get_tile_rect(tile, scale);
+        let view_scale = self.get_scale();
+        let raster_scale = self.get_raster_scale();
+        self.render_area = tiles::get_tile_rect(tile, view_scale, self.viewbox.dpr);
         let margins = self.surfaces.margins();
-        let margin_w = margins.width as f32 / scale;
-        let margin_h = margins.height as f32 / scale;
+        let margin_w = margins.width as f32 / raster_scale;
+        let margin_h = margins.height as f32 / raster_scale;
         self.render_area_with_margins = skia::Rect::from_ltrb(
             self.render_area.left - margin_w,
             self.render_area.top - margin_h,
             self.render_area.right + margin_w,
             self.render_area.bottom + margin_h,
         );
-        self.surfaces.update_render_context(self.render_area, scale);
+        self.surfaces
+            .update_render_context(self.render_area, raster_scale);
     }
 
     fn rebuild_backbuffer_crop_cache(&mut self, tree: ShapesPoolRef) {
@@ -2028,19 +2113,22 @@ impl RenderState {
             })
             .collect();
 
+        if non_overlapping.is_empty() {
+            return;
+        }
+
         let vb_left = self.viewbox.area.left;
         let vb_top = self.viewbox.area.top;
         let (bb_w, bb_h) = self.surfaces.surface_size(SurfaceId::Backbuffer);
-        let max_snap_px = get_gpu_state().max_texture_size();
+        let max_tex = get_gpu_state().max_texture_size();
+        // Prefer viewport-sized crops so we can snapshot from Backbuffer (cheap)
+        // instead of allocating up to max_texture scratch + doc-atlas snapshot.
+        let max_w_px = bb_w.min(max_tex).max(1);
+        let max_h_px = bb_h.min(max_tex).max(1);
 
-        // Snapshot the atlas once for the whole pass so that all shapes sharing
-        // the tile/atlas fallback path reuse the same GPU image rather than each
-        // triggering a separate `image_snapshot` flush.
-        let atlas_snap = self.surfaces.atlas.snapshot_for_drag_crop();
-
-        // Scratch surface reused across all shapes that need the tile/atlas
-        // fallback — avoids one WebGL texture allocation per shape.
-        // Created lazily on first use and grown if a later shape needs more space.
+        // Lazily snapshot the doc atlas only if a shape falls outside the
+        // backbuffer and needs the tile/atlas fallback path.
+        let mut atlas_snap: Option<(skia::Image, f32, skia::Point)> = None;
         let mut scratch_surface: Option<skia::Surface> = None;
 
         for (id, doc_bounds, selrect) in non_overlapping {
@@ -2063,7 +2151,8 @@ impl RenderState {
             let full_w = src_irect.width();
             let full_h = src_irect.height();
             let (win_ox, win_oy, win_w, win_h) = drag_crop_snapshot_window_px(
-                max_snap_px,
+                max_w_px,
+                max_h_px,
                 full_w,
                 full_h,
                 viewport,
@@ -2103,6 +2192,9 @@ impl RenderState {
             let image = if let Some(img) = backbuffer_snap {
                 img
             } else {
+                if atlas_snap.is_none() {
+                    atlas_snap = self.surfaces.atlas.snapshot_for_drag_crop();
+                }
                 // Ensure the scratch surface is large enough for this window.
                 // Grow (reallocate) only when necessary so that the common case
                 // of similarly-sized shapes pays zero extra allocation cost.
@@ -2154,11 +2246,20 @@ impl RenderState {
     pub fn render_from_cache(&mut self, shapes: ShapesPoolRef) {
         let _start = performance::begin_timed_log!("render_from_cache");
         performance::begin_measure!("render_from_cache");
-        self.surfaces.draw_combined_atlas_to_backbuffer(
-            &self.viewbox,
-            &self.tile_viewbox,
-            self.background_color,
-        );
+        if self.zoom_changed() {
+            // DocAtlas is document-space and scales with the view. Tile sprites
+            // are keyed to the previous world-tile grid — overlaying them is what
+            // caused wrong-scale streaks. Drop sprites and preview DocAtlas only.
+            self.surfaces.clear_tile_sprites();
+            self.surfaces
+                .draw_atlas_to_backbuffer(self.viewbox, self.background_color);
+        } else {
+            self.surfaces.draw_combined_atlas_to_backbuffer(
+                &self.viewbox,
+                &self.tile_viewbox,
+                self.background_color,
+            );
+        }
         self.present_frame(shapes);
 
         performance::end_measure!("render_from_cache");
@@ -2227,7 +2328,7 @@ impl RenderState {
         let timestamp = self.render_budget_start(timestamp);
 
         let _start = performance::begin_timed_log!("start_render_loop");
-        let scale = self.get_scale();
+        let scale = self.get_raster_scale();
 
         self.tile_viewbox.update(&self.viewbox);
         self.focus_mode.reset();
@@ -2238,7 +2339,6 @@ impl RenderState {
         // Compute and set document-space bounds (1 unit == 1 doc px @ 100% zoom)
         // to clamp atlas updates. This prevents zoom-out tiles from forcing atlas
         // growth far beyond real content.
-        let t_bounds = performance::get_time();
         let doc_bounds = self.compute_document_bounds(base_object, tree);
         self.surfaces.atlas.set_doc_bounds(doc_bounds);
 
@@ -2247,7 +2347,6 @@ impl RenderState {
         self.preserve_target_during_render = false;
 
         if preserve_target && self.options.is_fast_mode() {
-            let t_idx = performance::get_time();
             self.rebuild_tile_index(tree);
         }
 
@@ -2303,8 +2402,8 @@ impl RenderState {
         let _tile_start = performance::begin_timed_log!("tile_cache_update");
 
         performance::begin_measure!("tile_cache");
-        let t_pending = performance::get_time();
-        let only_visible = self.options.is_interactive_transform();
+        let only_visible = self.options.is_interactive_transform()
+            || self.options.content_quality() == ContentQuality::Interactive;
         self.pending_tiles
             .update(&self.tile_viewbox, &self.surfaces, only_visible);
         performance::end_measure!("tile_cache");
@@ -2318,11 +2417,10 @@ impl RenderState {
         if sync_render {
             frame_type = self.render_shape_tree_sync(base_object, tree, timestamp)?;
         } else {
-            // Keep progressive yielding, except for a localized shape edit on a
-            // stable viewbox (e.g. recoloring) which renders in one frame.
-            let allow_stop =
-                !preserve_target || self.zoom_changed() || self.options.is_interactive_transform();
-            let t_cont = performance::get_time();
+            // Always allow progressive yielding. `preserve_target` keeps the last
+            // frame visible while tiles fill in. Gating allow_stop on preserve_target
+            // forced a synchronous interest-area pass after pan and blocked HiDPI.
+            let allow_stop = true;
             frame_type = self.continue_render_loop(base_object, tree, timestamp, allow_stop)?;
 
             // This is an option to debug frames.
@@ -2386,14 +2484,25 @@ impl RenderState {
         allow_stop: bool,
     ) -> Result<FrameType> {
         performance::begin_measure!("continue_render_loop");
+        // Zoom gesture: `render_from_cache` owns presentation via DocAtlas.
+        // Skip so an in-flight settle cannot overlay old-grid tile sprites.
+        if self.options.is_fast_mode() && self.zoom_changed() {
+            performance::end_measure!("continue_render_loop");
+            return Ok(FrameType::Partial);
+        }
         let timestamp = self.render_budget_start(timestamp);
-        let t0 = performance::get_time();
-        let pending_before = self.pending_tiles.list.len();
+
+        // Soft already on screen: promote on a fresh rAF so atlas teardown /
+        // Full-quality setup does not share the soft present frame.
+        if self.pending_sharp_promote {
+            self.pending_sharp_promote = false;
+            self.try_begin_full_quality_pass(tree)?;
+            performance::end_measure!("continue_render_loop");
+            return Ok(FrameType::Partial);
+        }
 
         let frame_type =
             self.render_shape_tree_partial(base_object, tree, timestamp, allow_stop)?;
-
-        let t_tree = performance::get_time();
 
         // `draw_atlas` needs a snapshot of the tile atlas. Partial frames are not
         // presented (only flushed), so defer composition to the final frame and
@@ -2406,28 +2515,45 @@ impl RenderState {
             );
         }
 
+        // Soft settle (Interactive, viewport, DPR≤1 fill-rate): present now so
+        // the UI sees content, then defer Full+interest at real DPR to the next
+        // continue (browser gets a frame between passes).
+        if !self.options.is_interactive_transform()
+            && matches!(frame_type, FrameType::Full)
+            && self.options.needs_full_quality_upgrade()
+        {
+            self.present_frame(tree);
+            self.viewport_presented = true;
+            wapi::notify_tiles_render_complete!();
+            let _ = self.restore_paint_surfaces_to_viewport();
+            self.pending_sharp_promote = true;
+            performance::end_measure!("continue_render_loop");
+            return Ok(FrameType::Partial);
+        }
+
         match frame_type {
             FrameType::None => {
                 panic!("FrameType::None");
             }
             FrameType::Partial => {
-                // Partial frame: just flush GPU work. The display shows the last
-                // fully submitted frame; no need to copy or draw UI overlays here.
-                self.flush();
+                // Do not flush here. On WASM, `context.flush(None)` still waited
+                // ~470ms after paint-once DONE (same as flush_and_submit). The
+                // intentional Partial yield after DONE only helps if we return
+                // immediately; hard sync belongs in present_frame.
             }
             FrameType::Full => {
+                self.sharp_tile_refill = false;
                 // A full-quality frame is now complete. Rebuild the per-shape crop
                 // cache from the clean Backbuffer (no UI overlay yet) so that
                 // interactive drag backgrounds don't include the grid overlay.
                 if !self.options.is_fast_mode() && !self.options.is_interactive_transform() {
-                    let t_crop = performance::get_time();
                     self.rebuild_backbuffer_crop_cache(tree);
                 }
                 // present_frame: copy clean Backbuffer → Target, draw UI/debug
                 // overlays on Target only, then flush. Backbuffer stays overlay-free.
                 self.present_frame(tree);
                 wapi::notify_tiles_render_complete!();
-
+                let _ = self.restore_paint_surfaces_to_viewport();
                 performance::end_measure!("render");
             }
         }
@@ -2564,10 +2690,10 @@ impl RenderState {
         // Restore render-surface transforms for the workspace context.
         // If we have a current tile, restore its tile render context; otherwise
         // fall back to restoring the previous render_area (may be empty).
-        let workspace_scale = self.get_scale();
         if let Some(tile) = self.current_tile {
             self.update_render_context(tile);
         } else if !self.render_area.is_empty() {
+            let workspace_scale = self.get_paint_scale();
             self.surfaces
                 .update_render_context(self.render_area, workspace_scale);
         }
@@ -2580,7 +2706,8 @@ impl RenderState {
         if iteration % self.options.node_batch_threshold != 0 {
             return false;
         }
-        if performance::get_time() - timestamp <= self.options.max_blocking_time_ms {
+        let budget = self.render_time_budget_ms();
+        if performance::get_time() - timestamp <= budget {
             return false;
         }
 
@@ -2597,6 +2724,17 @@ impl RenderState {
         }
 
         true
+    }
+
+    /// Per-frame CPU budget for progressive tile work.
+    #[inline]
+    fn render_time_budget_ms(&self) -> i32 {
+        // Sharp HiDPI tiles are expensive (1024² at DPR=2); keep slices short
+        // so the frontend stays responsive after zoom.
+        if self.sharp_tile_refill {
+            return self.options.max_blocking_time_ms.min(8).max(4);
+        }
+        self.options.max_blocking_time_ms
     }
 
     /// Push pending GPU work without waiting so Partial `flush_and_submit`
@@ -2876,7 +3014,7 @@ impl RenderState {
             .current_tile
             .ok_or(Error::CriticalError("Current tile not found".to_string()))?;
         let offset = self.viewbox.get_offset();
-        Ok(tile.get_rect_with_offset(&offset))
+        Ok(tile.get_rect_with_offset(&offset, tiles::device_tile_size_px(self.viewbox.dpr)))
     }
 
     pub fn get_rect_bounds(&mut self, rect: skia::Rect) -> Rect {
@@ -2904,15 +3042,16 @@ impl RenderState {
 
     pub fn get_aligned_tile_bounds(&mut self, tile: tiles::Tile) -> Rect {
         let scale = self.get_scale();
+        let device_tile = tiles::device_tile_size_px(self.viewbox.dpr);
         let start_tile_x =
-            (self.viewbox.area.left * scale / tiles::TILE_SIZE).floor() * tiles::TILE_SIZE;
+            (self.viewbox.area.left * scale / device_tile).floor() * device_tile;
         let start_tile_y =
-            (self.viewbox.area.top * scale / tiles::TILE_SIZE).floor() * tiles::TILE_SIZE;
+            (self.viewbox.area.top * scale / device_tile).floor() * device_tile;
         Rect::from_xywh(
-            (tile.x() as f32 * tiles::TILE_SIZE) - start_tile_x,
-            (tile.y() as f32 * tiles::TILE_SIZE) - start_tile_y,
-            tiles::TILE_SIZE,
-            tiles::TILE_SIZE,
+            (tile.x() as f32 * device_tile) - start_tile_x,
+            (tile.y() as f32 * device_tile) - start_tile_y,
+            device_tile,
+            device_tile,
         )
     }
 
@@ -3589,7 +3728,7 @@ impl RenderState {
                     Cow::Borrowed(element)
                 };
 
-                let is_text = matches!(element_for_inline.shape_type, Type::Text(_));
+                let _is_text = matches!(element_for_inline.shape_type, Type::Text(_));
                 self.render_shape(
                     &element_for_inline,
                     clip_bounds.clone(),
@@ -3674,13 +3813,14 @@ impl RenderState {
                 }
             }
 
-            // We try to avoid doing too many calls to get_time
-            if allow_stop && iteration % self.options.node_batch_threshold == 0 {
-                // Kick GPU work while the walker continues so Partial
-                // flush_and_submit does not wait on a full paint-region backlog.
-                if self.paint_region.is_some() {
-                    self.soft_flush_gpu();
-                }
+            // Kick GPU work while the walker continues. Skip during paint-once:
+            // on WASM `flush(None)` still syncs and the final Partial paid ~470ms;
+            // mid-chunk waits also inflate walker time. Present flushes instead.
+            if allow_stop
+                && self.paint_region.is_none()
+                && iteration % self.options.node_batch_threshold == 0
+            {
+                self.soft_flush_gpu();
             }
             if allow_stop && self.should_stop_rendering(iteration, timestamp) {
                 return Ok((is_empty, true));
@@ -3692,7 +3832,7 @@ impl RenderState {
     }
 
     fn update_render_context_for_area(&mut self, area: Rect) {
-        let scale = self.get_scale();
+        let scale = self.get_paint_scale();
         self.render_area = area;
         let margins = self.surfaces.margins();
         let margin_w = margins.width as f32 / scale;
@@ -3708,6 +3848,9 @@ impl RenderState {
 
     /// Drain pending uncached tiles into a paint-once region when safe.
     /// Returns true when `paint_region` was started and nodes were seeded.
+    ///
+    /// Used for the soft settle pass (DPR≤1 fill-rate, one tree walk). The
+    /// sharp HiDPI refill sets `sharp_tile_refill` and skips this path.
     fn try_begin_paint_region(
         &mut self,
         root_ids: &[Uuid],
@@ -3716,11 +3859,19 @@ impl RenderState {
         if self.viewer_masked_pass() || self.options.is_interactive_transform() {
             return Ok(false);
         }
+        // Sharp HiDPI pass: walk/paint per tile at full view DPR.
+        if self.sharp_tile_refill {
+            return Ok(false);
+        }
         if self.paint_region.is_some() || !self.pending_nodes.is_empty() {
             return Ok(false);
         }
 
-        let label = "region";
+        let label = if self.options.content_quality() == ContentQuality::Interactive {
+            "visible"
+        } else {
+            "region"
+        };
 
         let mut region_tiles = Vec::new();
         let mut remaining = Vec::new();
@@ -3740,10 +3891,11 @@ impl RenderState {
             return Ok(false);
         }
 
-        let scale = self.get_scale();
+        let view_scale = self.get_scale();
+        let paint_scale = self.get_paint_scale();
         let mut area = Rect::new_empty();
         for tile in &region_tiles {
-            let r = tiles::get_tile_rect(*tile, scale);
+            let r = tiles::get_tile_rect(*tile, view_scale, self.viewbox.dpr);
             if area.is_empty() {
                 area = r;
             } else {
@@ -3751,11 +3903,21 @@ impl RenderState {
             }
         }
 
-        if region_tiles.len() == 1 || !self.surfaces.region_fits_paint_surface(area, scale) {
-            // Restore for the single-tile path (pop from end).
+        // No banding: one paint-once of the whole pending set, or per-tile.
+        // Fit is against GPU max texture — Current is resized to the region below.
+        if region_tiles.len() == 1
+            || !self
+                .surfaces
+                .region_fits_paint_surface(area, paint_scale)
+        {
             self.pending_tiles.list.extend(region_tiles);
             return Ok(false);
         }
+
+        // Shrink Current (+ layers) to the region so soft settle does not clear /
+        // flush a HiDPI viewport-sized surface.
+        let need = self.surfaces.paint_region_need_dims(area, paint_scale);
+        self.surfaces.resize_paint_surfaces_to(need)?;
 
         self.update_render_context_for_area(area);
         self.current_tile = Some(region_tiles[0]);
@@ -3815,15 +3977,16 @@ impl RenderState {
             crate::get_gpu_state().context.flush_and_submit();
         }
         self.cache_cleared_this_render = true;
-        let scale = self.get_scale();
+        let view_scale = self.get_scale();
+        let paint_scale = self.get_paint_scale();
         let render_area = self.render_area;
 
         for tile in &region.tiles {
-            let tile_doc_rect = tiles::get_tile_rect(*tile, scale);
+            let tile_doc_rect = tiles::get_tile_rect(*tile, view_scale, self.viewbox.dpr);
             let src = self.surfaces.tile_drawable_src_in_region(
                 tile_doc_rect,
                 render_area,
-                scale,
+                paint_scale,
             );
             let aligned = self.get_aligned_tile_bounds(*tile);
             self.surfaces.draw_current_src_into_tile_atlas(
@@ -3835,7 +3998,20 @@ impl RenderState {
                 src,
             );
         }
+        // Do not restore Current here — recreating surfaces can sync the GPU
+        // and reintroduce the DONE-frame hitch. Restore after present.
         Ok(())
+    }
+
+    /// Grow Current back to viewport + interest pad after a region-sized paint-once.
+    fn restore_paint_surfaces_to_viewport(&mut self) -> Result<()> {
+        let dpr_width = (self.viewbox.width() * self.options.dpr).floor() as i32;
+        let dpr_height = (self.viewbox.height() * self.options.dpr).floor() as i32;
+        self.surfaces.resize_paint_surfaces(
+            dpr_width,
+            dpr_height,
+            self.options.dpr_viewport_interest_area_threshold,
+        )
     }
 
     pub fn render_shape_tree_partial(
@@ -3885,6 +4061,12 @@ impl RenderState {
                         if !is_empty || self.current_tile_had_shapes {
                             self.apply_paint_region_to_atlas(&region)?;
                         }
+                        // Soft paint-once can be large; yield so the UI can run.
+                        if allow_stop {
+                            self.current_tile = None;
+                            self.viewer_render_root = None;
+                            return Ok(FrameType::Partial);
+                        }
                     } else {
                         let tile_rect = self.get_current_tile_bounds()?;
                         // Composite if the walker did work in this PAF (`!is_empty`) OR
@@ -3912,6 +4094,17 @@ impl RenderState {
                                     tile_rect,
                                 );
                             }
+                        }
+                        // Sharp HiDPI: at most one tile per rAF. Also yield when
+                        // the frame budget is already spent.
+                        if allow_stop
+                            && (self.sharp_tile_refill
+                                || performance::get_time() - timestamp
+                                    > self.render_time_budget_ms())
+                        {
+                            self.current_tile = None;
+                            self.viewer_render_root = None;
+                            return Ok(FrameType::Partial);
                         }
                     }
                 } else if self.tiles.is_empty_at(current_tile) {
@@ -4033,7 +4226,7 @@ impl RenderState {
     pub fn get_tiles_for_shape(&mut self, shape: &Shape, tree: ShapesPoolRef) -> TileRect {
         let scale = self.get_scale();
         let extrect = self.get_cached_extrect(shape, tree, scale);
-        let tile_size = tiles::get_tile_size(scale);
+        let tile_size = tiles::get_tile_size(scale, self.viewbox.dpr);
         let shape_tiles = tiles::get_tiles_for_rect(extrect, tile_size);
         let interest_rect = &self.tile_viewbox.interest_rect;
         // Calculate the intersection of shape_tiles with interest_rect
@@ -4190,14 +4383,13 @@ impl RenderState {
     pub fn rebuild_tile_index(&mut self, tree: ShapesPoolRef) {
         let zoom_changed = self.zoom_changed();
         performance::begin_measure!("rebuild_tile_index");
-        let t0 = performance::get_time();
-        let mut shapes_visited = 0u32;
+        let mut _shapes_visited = 0u32;
         let mut nodes = Vec::<Uuid>::with_capacity(64);
         nodes.push(Uuid::nil());
         while let Some(shape_id) = nodes.pop() {
             if let Some(shape) = tree.get(&shape_id) {
                 if shape_id != Uuid::nil() {
-                    shapes_visited += 1;
+                    _shapes_visited += 1;
                     if zoom_changed {
                         let _ = self.update_shape_tiles(shape, tree);
                     } else {
@@ -4219,14 +4411,9 @@ impl RenderState {
 
         self.rebuild_tile_index(tree);
 
-        // Zoom changes world tile size: a partial cache update would mix scales in the
-        // mosaic and glitch. Same zoom as last finished render (typical pan): drop only
-        // tile textures and keep the cache canvas for render_from_cache.
-        if self.zoom_changed() {
-            self.surfaces.remove_cached_tiles(self.background_color);
-        } else {
-            self.surfaces.invalidate_tile_cache();
-        }
+        // Drop tile sprites (wrong world-tile grid after zoom). Keep DocAtlas
+        // pixels so zoom-out preview can scale document coverage.
+        self.surfaces.invalidate_tile_cache();
 
         performance::end_measure!("rebuild_tiles_shallow");
     }
@@ -4356,6 +4543,32 @@ impl RenderState {
             return export_scale;
         }
         self.viewbox.get_scale()
+    }
+
+    /// Doc→pixel scale for *tile raster* surfaces (Current/Fills/… in single-tile mode).
+    ///
+    /// At full quality this equals [`Self::get_scale`] (`zoom * dpr`). During
+    /// interactive HiDPI LOD, atlas sprites are only `BASE` px wide so the CTM
+    /// must be `zoom` — otherwise shapes are drawn 2× too large into the tile.
+    pub fn get_raster_scale(&self) -> f32 {
+        if let Some((_, export_scale)) = self.export_context {
+            return export_scale;
+        }
+        let raster = self.surfaces.tile_size_px() as f32;
+        let world_tile =
+            tiles::get_tile_size(self.viewbox.get_scale(), self.viewbox.dpr).max(1e-6);
+        raster / world_tile
+    }
+
+    /// Scale matching the active paint CTM on Current/Fills/….
+    ///
+    /// Always [`Self::get_raster_scale`]: at full quality that equals view
+    /// scale (`zoom * dpr`); during interactive HiDPI LOD it is `zoom` so
+    /// paint-once and single-tile stamps both match DPR=1 fill-rate. Using
+    /// view scale for paint-once during soft settle re-introduced the DPR=2
+    /// zoom hitch (full-res walk, then another walk on sharp promote).
+    pub fn get_paint_scale(&self) -> f32 {
+        self.get_raster_scale()
     }
 
     pub fn zoom_changed(&self) -> bool {

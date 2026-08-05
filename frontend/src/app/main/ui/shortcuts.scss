@@ -21,7 +21,7 @@
 
 .section-title,
 .subsection-title {
-  @include t.use-typography("title-small");
+  @include t.use-typography("headline-small");
 
   display: flex;
   align-items: center;

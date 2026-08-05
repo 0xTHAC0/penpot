@@ -24,7 +24,7 @@
 - Zoom changes rebuild the tile index while preserving cached tile textures. Avoid replacing that path with shallow rebuilds if blur/shadow cache preservation matters.
 - Two-phase HiDPI zoom settle: (1) **Interactive** — one paint-once of **visible** tiles at DPR≤1 fill-rate (`tile_px=512`, `paint_scale≈zoom`); present + notify. (2) Deferred **Full** — `512*dpr` sprites, **visible+interest**, paint-once when the region fits (else per-tile). At DPR≤1 there is no Interactive phase. CTM must use `get_paint_scale()` / `get_raster_scale()`.
 - Soft settle schedules `pending_sharp_promote` (next `continue`); do not stay Interactive forever.
-- Partial frames **skip** GPU flush; hard sync in `present_frame` / ViewportReady.
+- Partial frames **skip** GPU flush; hard sync belongs in `present_frame` / Full.
 - Paint-once **resizes Current** to the region, restores viewport pad after present.
 - Zoom-gesture preview: **DocAtlas only** when `zoom_changed` (no tile-sprite overlay). `invalidate_tile_cache` clears sprites only — not `DocAtlas::reset()`. `continue_render_loop` no-ops while `fast_mode && zoom_changed`.
 - Full-quality `tile_px=1024` → ~16 atlas slots; `TileTextureCache::add` must not panic (see harden rules below).

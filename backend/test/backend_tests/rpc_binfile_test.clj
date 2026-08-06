@@ -22,13 +22,21 @@
   (let [schema @#'binfile/schema:import-binfile
         validator (sm/lazy-validator schema)
 
-        valid-params {:name "test"
-                      :project-id (uuid/random)
-                      :version 3
-                      :upload-id (uuid/random)}]
+        valid-params
+        {:name "test"
+         :project-id (uuid/random)
+         :version 3
+         :upload-id (uuid/random)}
+
+        params-with-file-id
+        (assoc valid-params :file-id (uuid/random))]
 
     (t/is (true? (validator valid-params))
           "params without file-id should be valid")
 
     (t/is (not (contains? (sm/keys (second schema)) :file-id))
-          "file-id should not be a declared parameter")))
+          "file-id should not be a declared parameter")
+
+    ;; Params with file-id should fail (schema closed)
+    (t/is (false? (validator params-with-file-id))
+          "params with file-id should be rejected")))

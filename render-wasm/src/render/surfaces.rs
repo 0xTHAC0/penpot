@@ -513,8 +513,13 @@ impl Surfaces {
 
         // Current + layers cover viewport + interest + blur margins so a
         // paint-once region pass needs no surface recreate on zoom.
-        let extra_tile_dims =
-            paint_surface_dims(width, height, interest_tiles, tile_size_px, max_texture_size);
+        let extra_tile_dims = paint_surface_dims(
+            width,
+            height,
+            interest_tiles,
+            tile_size_px,
+            max_texture_size,
+        );
         let margin = tile_size_px * TILE_SIZE_MULTIPLIER / 4;
         let margins = skia::ISize::new(margin, margin);
 
@@ -772,12 +777,7 @@ impl Surfaces {
         self.margins
     }
 
-    pub fn resize(
-        &mut self,
-        new_width: i32,
-        new_height: i32,
-        interest_tiles: i32,
-    ) -> Result<()> {
+    pub fn resize(&mut self, new_width: i32, new_height: i32, interest_tiles: i32) -> Result<()> {
         let gpu_state = get_gpu_state();
 
         self.reset_from_target(gpu_state.create_target_surface(new_width, new_height)?)?;
@@ -1202,10 +1202,7 @@ impl Surfaces {
         let new_w = needed.width.max(current_w);
         let new_h = needed.height.max(current_h);
         if new_w > current_w || new_h > current_h {
-            let result = self.resize_cache(
-                skia::ISize::new(new_w, new_h),
-                interest_area_threshold,
-            );
+            let result = self.resize_cache(skia::ISize::new(new_w, new_h), interest_area_threshold);
             return result;
         }
         Ok(())
@@ -2066,11 +2063,7 @@ impl TileTextureCache {
         None
     }
 
-    fn farthest_visible_victim(
-        &self,
-        tile_viewbox: &TileViewbox,
-        keep: &Tile,
-    ) -> Option<Tile> {
+    fn farthest_visible_victim(&self, tile_viewbox: &TileViewbox, keep: &Tile) -> Option<Tile> {
         let cx = (tile_viewbox.visible_rect.left() + tile_viewbox.visible_rect.right()) / 2;
         let cy = (tile_viewbox.visible_rect.top() + tile_viewbox.visible_rect.bottom()) / 2;
         self.grid

@@ -3043,10 +3043,8 @@ impl RenderState {
     pub fn get_aligned_tile_bounds(&mut self, tile: tiles::Tile) -> Rect {
         let scale = self.get_scale();
         let device_tile = tiles::device_tile_size_px(self.viewbox.dpr);
-        let start_tile_x =
-            (self.viewbox.area.left * scale / device_tile).floor() * device_tile;
-        let start_tile_y =
-            (self.viewbox.area.top * scale / device_tile).floor() * device_tile;
+        let start_tile_x = (self.viewbox.area.left * scale / device_tile).floor() * device_tile;
+        let start_tile_y = (self.viewbox.area.top * scale / device_tile).floor() * device_tile;
         Rect::from_xywh(
             (tile.x() as f32 * device_tile) - start_tile_x,
             (tile.y() as f32 * device_tile) - start_tile_y,
@@ -3851,11 +3849,7 @@ impl RenderState {
     ///
     /// Used for the soft settle pass (DPR≤1 fill-rate, one tree walk). The
     /// sharp HiDPI refill sets `sharp_tile_refill` and skips this path.
-    fn try_begin_paint_region(
-        &mut self,
-        root_ids: &[Uuid],
-        tree: ShapesPoolRef,
-    ) -> Result<bool> {
+    fn try_begin_paint_region(&mut self, root_ids: &[Uuid], tree: ShapesPoolRef) -> Result<bool> {
         if self.viewer_masked_pass() || self.options.is_interactive_transform() {
             return Ok(false);
         }
@@ -3905,11 +3899,7 @@ impl RenderState {
 
         // No banding: one paint-once of the whole pending set, or per-tile.
         // Fit is against GPU max texture — Current is resized to the region below.
-        if region_tiles.len() == 1
-            || !self
-                .surfaces
-                .region_fits_paint_surface(area, paint_scale)
-        {
+        if region_tiles.len() == 1 || !self.surfaces.region_fits_paint_surface(area, paint_scale) {
             self.pending_tiles.list.extend(region_tiles);
             return Ok(false);
         }
@@ -3983,11 +3973,9 @@ impl RenderState {
 
         for tile in &region.tiles {
             let tile_doc_rect = tiles::get_tile_rect(*tile, view_scale, self.viewbox.dpr);
-            let src = self.surfaces.tile_drawable_src_in_region(
-                tile_doc_rect,
-                render_area,
-                paint_scale,
-            );
+            let src =
+                self.surfaces
+                    .tile_drawable_src_in_region(tile_doc_rect, render_area, paint_scale);
             let aligned = self.get_aligned_tile_bounds(*tile);
             self.surfaces.draw_current_src_into_tile_atlas(
                 &self.tile_viewbox,
@@ -4555,8 +4543,7 @@ impl RenderState {
             return export_scale;
         }
         let raster = self.surfaces.tile_size_px() as f32;
-        let world_tile =
-            tiles::get_tile_size(self.viewbox.get_scale(), self.viewbox.dpr).max(1e-6);
+        let world_tile = tiles::get_tile_size(self.viewbox.get_scale(), self.viewbox.dpr).max(1e-6);
         raster / world_tile
     }
 

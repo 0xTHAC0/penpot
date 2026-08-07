@@ -3924,72 +3924,9 @@ impl RenderState {
         area
     }
 
-    /// Peel outer columns/rows from `tiles` until the AABB fits
-    /// `max_w`×`max_h` (+1px ceil slack). Returns deferred tiles.
-    fn shrink_tiles_to_paint_fit(
-        tiles: &mut Vec<tiles::Tile>,
-        scale: f32,
-        margins: skia::ISize,
-        max_w: i32,
-        max_h: i32,
-    ) -> Vec<tiles::Tile> {
-        let mut deferred = Vec::new();
-        let cx = tiles.iter().map(|t| t.x()).sum::<i32>() as f32 / tiles.len() as f32;
-        let cy = tiles.iter().map(|t| t.y()).sum::<i32>() as f32 / tiles.len() as f32;
-        let slack_w = max_w.saturating_add(1);
-        let slack_h = max_h.saturating_add(1);
-
-        while tiles.len() > 1 {
-            let area = Self::tiles_doc_area(tiles, scale);
-            let need_w = (area.width() * scale).ceil() as i32 + 2 * margins.width;
-            let need_h = (area.height() * scale).ceil() as i32 + 2 * margins.height;
-            if need_w <= slack_w && need_h <= slack_h {
-                break;
-            }
-
-            let min_x = tiles.iter().map(|t| t.x()).min().unwrap();
-            let max_x = tiles.iter().map(|t| t.x()).max().unwrap();
-            let min_y = tiles.iter().map(|t| t.y()).min().unwrap();
-            let max_y = tiles.iter().map(|t| t.y()).max().unwrap();
-
-            // Prefer shrinking the oversize axis; drop the edge farthest from centroid.
-            let drop_x = need_w > slack_w || (max_x - min_x) >= (max_y - min_y);
-            let drop_lo = if drop_x {
-                (cx - min_x as f32) >= (max_x as f32 - cx)
-            } else {
-                (cy - min_y as f32) >= (max_y as f32 - cy)
-            };
-
-            let edge_x = if drop_lo { min_x } else { max_x };
-            let edge_y = if drop_lo { min_y } else { max_y };
-
-            let mut kept = Vec::with_capacity(tiles.len());
-            for tile in tiles.drain(..) {
-                let on_edge = if drop_x {
-                    tile.x() == edge_x
-                } else {
-                    tile.y() == edge_y
-                };
-                if on_edge {
-                    deferred.push(tile);
-                } else {
-                    kept.push(tile);
-                }
-            }
-            *tiles = kept;
-            if tiles.is_empty() {
-                if let Some(t) = deferred.pop() {
-                    tiles.push(t);
-                }
-                break;
-            }
-        }
-        deferred
-    }
-
-    /// Drain pending uncached tiles into a paint-once region when safe.
-    /// Returns true when `paint_region` was started and nodes were seeded.
-    fn try_begin_paint_region(&mut self, root_ids: &[Uuid], tree: ShapesPoolRef) -> Result<bool> {
+    /// Drain pending uncached tiles into one paint-once region: a single tree
+    /// walk into Current, then crop to atlas slots. No banding / re-walks.
+    fn try_begin_paint_region(&mut self, root_ids: &[Uuid], _tree: ShapesPoolRef) -> Result<bool> {
         if self.viewer_masked_pass() || self.options.is_interactive_transform() {
             println!(
                 "[PAINT-PERF] skip_paint_region viewer_mask={} interactive={}",
@@ -4006,14 +3943,10 @@ impl RenderState {
         let mut region_tiles = Vec::new();
         let mut cached_n = 0usize;
         for tile in self.pending_tiles.list.drain(..) {
-            // Cached tiles are composed from the atlas; drop them from pending.
             if self.surfaces.has_cached_tile_surface(tile) {
                 cached_n += 1;
                 continue;
             }
-            // Include empty tiles too: the region AABB is the interest set, and
-            // the walker seeds roots (below) so shapes still get indexed/painted
-            // even when the tile grid is stale or sparse.
             region_tiles.push(tile);
         }
 
@@ -4025,116 +3958,64 @@ impl RenderState {
             return Ok(false);
         }
 
-        let empty_n = region_tiles
-            .iter()
-            .filter(|t| self.tiles.is_empty_at(**t))
-            .count();
-
-        let scale = self.get_scale();
-        let mut area = Self::tiles_doc_area(&region_tiles, scale);
-        let mut need = self.surfaces.paint_region_need_dims(area, scale);
-        let have = self.surfaces.paint_surface_size();
-
-        // Band to the current viewport-sized Current (do not grow to GPU max —
-        // that packed too much GPU work and hung the browser on Full present).
-        if region_tiles.len() > 1 && !self.surfaces.region_fits_paint_surface(area, scale) {
-            let before = region_tiles.len();
-            let deferred = Self::shrink_tiles_to_paint_fit(
-                &mut region_tiles,
-                scale,
-                self.surfaces.margins(),
-                have.width,
-                have.height,
-            );
-            self.pending_tiles.list.extend(deferred);
-            area = Self::tiles_doc_area(&region_tiles, scale);
-            need = self.surfaces.paint_region_need_dims(area, scale);
+        if region_tiles.len() == 1 {
             println!(
-                "[PAINT-PERF] band_paint_region {}→{} tiles need={}x{} have={}x{}",
-                before,
-                region_tiles.len(),
-                need.width,
-                need.height,
-                have.width,
-                have.height
+                "[PAINT-PERF] skip_paint_region reason=single_tile pending={} cached={}",
+                pending_n, cached_n
             );
+            self.pending_tiles.list.extend(region_tiles);
+            return Ok(false);
         }
 
-        let fits = self.surfaces.region_fits_paint_surface(area, scale);
+        let scale = self.get_scale();
+        let area = Self::tiles_doc_area(&region_tiles, scale);
+        let need = self.surfaces.paint_region_need_dims(area, scale);
+        let have = self.surfaces.paint_surface_size();
+        let max = crate::get_gpu_state().max_texture_size();
 
-        if region_tiles.len() == 1 || !fits {
-            let reason = if region_tiles.len() == 1 {
-                "single_tile"
-            } else {
-                "too_big"
-            };
+        // One walk for the whole pending set. Only give up when the AABB cannot
+        // fit the GPU max texture (then fall back to per-tile).
+        if !self.surfaces.region_fits_paint_surface(area, scale) {
             println!(
-                "[PAINT-PERF] skip_paint_region reason={} tiles={} empty≈{} area=({:.0}x{:.0})@{:.3} need={}x{} have={}x{} pending={} cached={}",
-                reason,
+                "[PAINT-PERF] skip_paint_region reason=too_big tiles={} area=({:.0}x{:.0})@{:.3} need={}x{} max={} have={}x{}",
                 region_tiles.len(),
-                empty_n,
                 area.width(),
                 area.height(),
                 scale,
                 need.width,
                 need.height,
+                max,
                 have.width,
-                have.height,
-                pending_n,
-                cached_n
-            );
-            // Restore for the single-tile path (pop from end).
-            self.pending_tiles.list.extend(region_tiles);
-            return Ok(false);
-        }
-
-        let mut shape_ids: HashSet<Uuid> = HashSet::default();
-        let mut region_has_bg_blur = false;
-        for tile in &region_tiles {
-            if let Some(ids) = self.tiles.get_shapes_at(*tile) {
-                for id in ids {
-                    shape_ids.insert(*id);
-                    if !region_has_bg_blur {
-                        region_has_bg_blur = tree
-                            .get(id)
-                            .is_some_and(|s| s.visible_background_blur().is_some());
-                    }
-                }
-            }
-        }
-
-        let mut valid_ids = Vec::new();
-        // Empty/stale tile index, or any bg-blur in the region: walk all roots
-        // so shapes are (re)indexed and painted into the region in one pass.
-        if shape_ids.is_empty() || region_has_bg_blur {
-            valid_ids.extend(root_ids.iter().copied());
-        } else {
-            for root_id in root_ids {
-                if shape_ids.contains(root_id) {
-                    valid_ids.push(*root_id);
-                }
-            }
-        }
-
-        if valid_ids.is_empty() {
-            println!(
-                "[PAINT-PERF] skip_paint_region reason=no_root_ids tiles={} shapes_in_tiles={}",
-                region_tiles.len(),
-                shape_ids.len()
+                have.height
             );
             self.pending_tiles.list.extend(region_tiles);
             return Ok(false);
         }
 
-        // Current already covers viewport+interest; region was banded to fit.
+        // Resize Current to the full region (clamped to GPU max) so one walk
+        // covers every pending tile.
+        let t_resize = performance::get_time();
+        self.surfaces.resize_paint_surfaces_to(need)?;
+        let after = self.surfaces.paint_surface_size();
+        println!(
+            "[PAINT-PERF] resize_paint_region {}x{}→{}x{} ms={}",
+            have.width,
+            have.height,
+            after.width,
+            after.height,
+            performance::get_time() - t_resize
+        );
+
         self.update_render_context_for_area(area);
         self.current_tile = Some(region_tiles[0]);
         self.current_tile_had_shapes = true;
         self.tile_atlas_flushed = false;
         self.drop_shadows_ops_warmed = false;
 
+        // One tree walk: seed every root. Off-region shapes cull cheaply; a
+        // single frame with many children is painted once.
         self.pending_nodes
-            .extend(valid_ids.into_iter().map(|id| NodeRenderState {
+            .extend(root_ids.iter().copied().map(|id| NodeRenderState {
                 id,
                 visited_children: false,
                 clip_bounds: None,
@@ -4148,25 +4029,22 @@ impl RenderState {
             tiles: region_tiles,
         });
         println!(
-            "[PAINT-PERF] begin_paint_region tiles={} area=({:.0},{:.0},{:.0}x{:.0}) scale={:.3} need={}x{} have={}x{}",
+            "[PAINT-PERF] begin_paint_region tiles={} roots={} area=({:.0},{:.0},{:.0}x{:.0}) scale={:.3} need={}x{}",
             n_tiles,
+            root_ids.len(),
             area.left,
             area.top,
             area.width(),
             area.height(),
             scale,
             need.width,
-            need.height,
-            have.width,
-            have.height
+            need.height
         );
         Ok(true)
     }
 
     fn apply_paint_region_to_atlas(&mut self, region: &PaintRegion) -> Result<()> {
         let t0 = performance::get_time();
-        // Soft-drain only: hard flush_and_submit here waited on the whole
-        // paint-once backlog and hung the browser after zoom.
         Self::drain_partial_gpu_soft();
         self.cache_cleared_this_render = true;
         let scale = self.get_scale();
@@ -4192,9 +4070,29 @@ impl RenderState {
             region.tiles.len(),
             performance::get_time() - t0
         );
+        self.restore_paint_surfaces_to_viewport()?;
         // Yield one Partial before Full present so GPU work from this region
         // is not synced in the same rAF as compose+present.
         self.defer_full_after_paint_region = true;
+        Ok(())
+    }
+
+    fn restore_paint_surfaces_to_viewport(&mut self) -> Result<()> {
+        let dpr_width = (self.viewbox.width() * self.options.dpr).floor() as i32;
+        let dpr_height = (self.viewbox.height() * self.options.dpr).floor() as i32;
+        let before = self.surfaces.paint_surface_size();
+        self.surfaces.resize_paint_surfaces(
+            dpr_width,
+            dpr_height,
+            self.options.dpr_viewport_interest_area_threshold,
+        )?;
+        let after = self.surfaces.paint_surface_size();
+        if before != after {
+            println!(
+                "[PAINT-PERF] restore_paint_surfaces {}x{}→{}x{}",
+                before.width, before.height, after.width, after.height
+            );
+        }
         Ok(())
     }
 

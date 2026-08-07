@@ -1348,16 +1348,15 @@ impl Surfaces {
         }
     }
 
-    /// Whether a doc-space region fits in the **current** paint surface at
-    /// `scale`. Paint-once bands to this size instead of growing Current up to
-    /// the GPU max — a 4096² region packs too much GPU work and stalls the
-    /// browser on Full present after zoom.
+    /// Whether a doc-space region fits the **GPU max texture** at `scale`.
+    /// Current is resized to the region for a single tree walk; only fall back
+    /// to per-tile when the AABB exceeds the GPU limit.
     ///
     /// Allows 1px of ceil slack from `paint_region_need_dims`.
     pub fn region_fits_paint_surface(&self, render_area: skia::Rect, scale: f32) -> bool {
         let need = self.paint_region_need_dims(render_area, scale);
-        need.width <= self.current.width().saturating_add(1)
-            && need.height <= self.current.height().saturating_add(1)
+        let max = get_gpu_state().max_texture_size();
+        need.width <= max.saturating_add(1) && need.height <= max.saturating_add(1)
     }
 
     /// Pixel rect inside Current for a tile given the region `render_area` and scale.

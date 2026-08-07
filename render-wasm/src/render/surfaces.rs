@@ -690,7 +690,8 @@ impl Surfaces {
     }
 
     /// Recreate Current + layer surfaces for the viewport (+ interest pad).
-    /// Called only from window resize / init — not from zoom HQ passes.
+    /// Called from window resize / init, and to restore after a paint-once
+    /// region resize.
     pub fn resize_paint_surfaces(
         &mut self,
         viewport_w: i32,
@@ -699,6 +700,18 @@ impl Surfaces {
     ) -> Result<()> {
         let max_texture_size = get_gpu_state().max_texture_size();
         let dims = paint_surface_dims(viewport_w, viewport_h, interest_tiles, max_texture_size);
+        self.resize_paint_surfaces_to(dims)
+    }
+
+    /// Resize Current + layer surfaces to exact `dims` (clamped to GPU max).
+    /// Used by paint-once so the region can exceed the viewport-sized surface.
+    pub fn resize_paint_surfaces_to(&mut self, dims: skia::ISize) -> Result<()> {
+        let max_texture_size = get_gpu_state().max_texture_size();
+        let min_dim = TILE_SIZE + 2 * TILE_MARGIN_SIZE;
+        let dims = skia::ISize::new(
+            dims.width.clamp(min_dim, max_texture_size),
+            dims.height.clamp(min_dim, max_texture_size),
+        );
         if dims == self.extra_tile_dims {
             return Ok(());
         }
@@ -727,6 +740,12 @@ impl Surfaces {
 
     pub fn paint_surface_size(&self) -> skia::ISize {
         self.extra_tile_dims
+    }
+
+    pub fn paint_region_need_dims(&self, render_area: skia::Rect, scale: f32) -> skia::ISize {
+        let need_w = (render_area.width() * scale).ceil() as i32 + 2 * self.margins.width;
+        let need_h = (render_area.height() * scale).ceil() as i32 + 2 * self.margins.height;
+        skia::ISize::new(need_w, need_h)
     }
 
     pub fn tile_margin_size() -> i32 {
@@ -1329,11 +1348,16 @@ impl Surfaces {
         }
     }
 
-    /// Whether a doc-space region (with blur margins) fits in Current at `scale`.
+    /// Whether a doc-space region fits in the **current** paint surface at
+    /// `scale`. Paint-once bands to this size instead of growing Current up to
+    /// the GPU max — a 4096² region packs too much GPU work and stalls the
+    /// browser on Full present after zoom.
+    ///
+    /// Allows 1px of ceil slack from `paint_region_need_dims`.
     pub fn region_fits_paint_surface(&self, render_area: skia::Rect, scale: f32) -> bool {
-        let need_w = (render_area.width() * scale).ceil() as i32 + 2 * self.margins.width;
-        let need_h = (render_area.height() * scale).ceil() as i32 + 2 * self.margins.height;
-        need_w <= self.current.width() && need_h <= self.current.height()
+        let need = self.paint_region_need_dims(render_area, scale);
+        need.width <= self.current.width().saturating_add(1)
+            && need.height <= self.current.height().saturating_add(1)
     }
 
     /// Pixel rect inside Current for a tile given the region `render_area` and scale.

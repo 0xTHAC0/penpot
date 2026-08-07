@@ -44,7 +44,7 @@ pub(crate) use resources::RenderResources;
 
 type ClipStack = Vec<(Rect, Option<Corners>, Matrix)>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(u8)]
 pub enum FrameType {
     None = 0,
@@ -420,6 +420,9 @@ pub(crate) struct RenderState {
     pub drop_shadows_ops_warmed: bool,
     /// Multi-tile paint-once into Current, then crop to atlas slots.
     paint_region: Option<PaintRegion>,
+    /// After cropping a paint-once region, yield one Partial before Full
+    /// present so the GPU can drain without blocking the Full flush.
+    defer_full_after_paint_region: bool,
 }
 
 /// Active paint-once region (visible viewport tiles or interest ring).
@@ -611,6 +614,7 @@ impl RenderState {
             tile_atlas_flushed: false,
             drop_shadows_ops_warmed: false,
             paint_region: None,
+            defer_full_after_paint_region: false,
         })
     }
 
@@ -2296,6 +2300,7 @@ impl RenderState {
         // reorder by distance to the center.
         self.current_tile = None;
         self.paint_region = None;
+        self.defer_full_after_paint_region = false;
     }
 
     pub fn start_render_loop(
@@ -2310,6 +2315,7 @@ impl RenderState {
 
         let _start = performance::begin_timed_log!("start_render_loop");
         let scale = self.get_scale();
+        let t_loop = performance::get_time();
 
         self.tile_viewbox.update(&self.viewbox);
         self.focus_mode.reset();
@@ -2320,17 +2326,25 @@ impl RenderState {
         // Compute and set document-space bounds (1 unit == 1 doc px @ 100% zoom)
         // to clamp atlas updates. This prevents zoom-out tiles from forcing atlas
         // growth far beyond real content.
-        let t_bounds = performance::get_time();
+        let t0 = performance::get_time();
         let doc_bounds = self.compute_document_bounds(base_object, tree);
         self.surfaces.atlas.set_doc_bounds(doc_bounds);
+        println!(
+            "[PAINT-PERF] start doc_bounds={}ms",
+            performance::get_time() - t0
+        );
 
         self.cache_cleared_this_render = false;
         let preserve_target = self.preserve_target_during_render;
         self.preserve_target_during_render = false;
 
         if preserve_target && self.options.is_fast_mode() {
-            let t_idx = performance::get_time();
+            let t0 = performance::get_time();
             self.rebuild_tile_index(tree);
+            println!(
+                "[PAINT-PERF] start rebuild_tile_index={}ms",
+                performance::get_time() - t0
+            );
         }
 
         if self.options.is_interactive_transform() {
@@ -2359,8 +2373,13 @@ impl RenderState {
             // instead of blanking until the first full `present_frame`.
             // Skip on sync renders (thumbnails/exports)
             if !sync_render {
+                let t0 = performance::get_time();
                 ui::render(self, tree);
                 self.flush_and_submit();
+                println!(
+                    "[PAINT-PERF] start ui+flush={}ms",
+                    performance::get_time() - t0
+                );
             }
         }
 
@@ -2373,11 +2392,16 @@ impl RenderState {
             s.canvas().scale((scale, scale));
         });
 
+        let t0 = performance::get_time();
         self.surfaces.resize_cache_from_viewbox(
             &self.viewbox,
             &self.cached_viewbox,
             self.options.dpr_viewport_interest_area_threshold,
         )?;
+        println!(
+            "[PAINT-PERF] start resize_cache={}ms",
+            performance::get_time() - t0
+        );
 
         // FIXME - review debug
         // debug::render_debug_tiles_for_viewbox(self);
@@ -2385,10 +2409,15 @@ impl RenderState {
         let _tile_start = performance::begin_timed_log!("tile_cache_update");
 
         performance::begin_measure!("tile_cache");
-        let t_pending = performance::get_time();
+        let t0 = performance::get_time();
         let only_visible = self.options.is_interactive_transform();
         self.pending_tiles
             .update(&self.tile_viewbox, &self.surfaces, only_visible);
+        println!(
+            "[PAINT-PERF] start pending_tiles={}ms pending={}",
+            performance::get_time() - t0,
+            self.pending_tiles.list.len()
+        );
         performance::end_measure!("tile_cache");
 
         performance::end_timed_log!("tile_cache_update", _tile_start);
@@ -2404,8 +2433,14 @@ impl RenderState {
             // stable viewbox (e.g. recoloring) which renders in one frame.
             let allow_stop =
                 !preserve_target || self.zoom_changed() || self.options.is_interactive_transform();
-            let t_cont = performance::get_time();
+            let t0 = performance::get_time();
             frame_type = self.continue_render_loop(base_object, tree, timestamp, allow_stop)?;
+            println!(
+                "[PAINT-PERF] start continue={}ms frame={:?} total={}ms",
+                performance::get_time() - t0,
+                frame_type,
+                performance::get_time() - t_loop
+            );
 
             // This is an option to debug frames.
             if self.options.capture_frames > 0 {
@@ -2469,43 +2504,84 @@ impl RenderState {
     ) -> Result<FrameType> {
         performance::begin_measure!("continue_render_loop");
         let timestamp = self.render_budget_start(timestamp);
+        let t0 = performance::get_time();
+        let pending_before = self.pending_tiles.list.len();
         let frame_type =
             self.render_shape_tree_partial(base_object, tree, timestamp, allow_stop)?;
+        let tree_ms = performance::get_time() - t0;
 
         // `draw_atlas` needs a snapshot of the tile atlas. Partial frames are not
         // presented (only flushed), so defer composition to the final frame and
         // avoid re-snapshotting up to 4096² on every rAF during async tile work.
+        let mut compose_ms = 0;
         if !self.options.is_interactive_transform() && matches!(frame_type, FrameType::Full) {
+            let t1 = performance::get_time();
             self.surfaces.draw_tile_atlas_to_backbuffer(
                 &self.viewbox,
                 &self.tile_viewbox,
                 self.background_color,
             );
+            compose_ms = performance::get_time() - t1;
         }
 
+        let mut tail_ms = 0;
         match frame_type {
             FrameType::None => {
                 panic!("FrameType::None");
             }
             FrameType::Partial => {
-                // Final soft drain for this yield (mid-walk also drains; see
-                // `drain_partial_gpu_soft`). Full still submits via present_frame.
-                Self::drain_partial_gpu_soft();
+                let t1 = performance::get_time();
+                if self.defer_full_after_paint_region && self.paint_region.is_none() {
+                    // Dedicated rAF to sync the paint-once GPU backlog before
+                    // Full compose/present (avoids a long hang on zoom settle).
+                    crate::get_gpu_state().context.flush_and_submit();
+                    self.defer_full_after_paint_region = false;
+                    println!(
+                        "[PAINT-PERF] post-region GPU submit={}ms",
+                        performance::get_time() - t1
+                    );
+                } else {
+                    // Final soft drain for this yield (mid-walk also drains; see
+                    // `drain_partial_gpu_soft`). Full still submits via present_frame.
+                    Self::drain_partial_gpu_soft();
+                }
+                tail_ms = performance::get_time() - t1;
             }
             FrameType::Full => {
+                let t1 = performance::get_time();
                 // A full-quality frame is now complete. Rebuild the per-shape crop
                 // cache from the clean Backbuffer (no UI overlay yet) so that
                 // interactive drag backgrounds don't include the grid overlay.
+                let mut crop_ms = 0;
                 if !self.options.is_fast_mode() && !self.options.is_interactive_transform() {
+                    let t2 = performance::get_time();
                     self.rebuild_backbuffer_crop_cache(tree);
+                    crop_ms = performance::get_time() - t2;
                 }
                 // present_frame: copy clean Backbuffer → Target, draw UI/debug
                 // overlays on Target only, then flush. Backbuffer stays overlay-free.
+                let t2 = performance::get_time();
                 self.present_frame(tree);
+                let present_ms = performance::get_time() - t2;
                 wapi::notify_tiles_render_complete!();
                 performance::end_measure!("render");
+                tail_ms = performance::get_time() - t1;
+                println!(
+                    "[PAINT-PERF] continue Full crop={}ms present={}ms tail={}ms",
+                    crop_ms, present_ms, tail_ms
+                );
             }
         }
+        println!(
+            "[PAINT-PERF] continue {:?} tree={}ms compose={}ms flush/present={}ms pending {}→{} total={}ms",
+            frame_type,
+            tree_ms,
+            compose_ms,
+            tail_ms,
+            pending_before,
+            self.pending_tiles.list.len(),
+            performance::get_time() - t0
+        );
         performance::end_measure!("continue_render_loop");
         Ok(frame_type)
     }
@@ -3835,37 +3911,9 @@ impl RenderState {
         self.surfaces.update_render_context(self.render_area, scale);
     }
 
-    /// Drain pending uncached tiles into a paint-once region when safe.
-    /// Returns true when `paint_region` was started and nodes were seeded.
-    fn try_begin_paint_region(&mut self, root_ids: &[Uuid], tree: ShapesPoolRef) -> Result<bool> {
-        if self.viewer_masked_pass() || self.options.is_interactive_transform() {
-            return Ok(false);
-        }
-        if self.paint_region.is_some() || !self.pending_nodes.is_empty() {
-            return Ok(false);
-        }
-
-        let mut region_tiles = Vec::new();
-        let mut remaining = Vec::new();
-        for tile in self.pending_tiles.list.drain(..) {
-            if self.surfaces.has_cached_tile_surface(tile) {
-                continue;
-            }
-            if self.tiles.is_empty_at(tile) {
-                remaining.push(tile);
-                continue;
-            }
-            region_tiles.push(tile);
-        }
-        self.pending_tiles.list = remaining;
-
-        if region_tiles.is_empty() {
-            return Ok(false);
-        }
-
-        let scale = self.get_scale();
+    fn tiles_doc_area(tiles: &[tiles::Tile], scale: f32) -> Rect {
         let mut area = Rect::new_empty();
-        for tile in &region_tiles {
+        for tile in tiles {
             let r = tiles::get_tile_rect(*tile, scale);
             if area.is_empty() {
                 area = r;
@@ -3873,18 +3921,172 @@ impl RenderState {
                 area.join(r);
             }
         }
+        area
+    }
 
-        if region_tiles.len() == 1 || !self.surfaces.region_fits_paint_surface(area, scale) {
+    /// Peel outer columns/rows from `tiles` until the AABB fits
+    /// `max_w`×`max_h` (+1px ceil slack). Returns deferred tiles.
+    fn shrink_tiles_to_paint_fit(
+        tiles: &mut Vec<tiles::Tile>,
+        scale: f32,
+        margins: skia::ISize,
+        max_w: i32,
+        max_h: i32,
+    ) -> Vec<tiles::Tile> {
+        let mut deferred = Vec::new();
+        let cx = tiles.iter().map(|t| t.x()).sum::<i32>() as f32 / tiles.len() as f32;
+        let cy = tiles.iter().map(|t| t.y()).sum::<i32>() as f32 / tiles.len() as f32;
+        let slack_w = max_w.saturating_add(1);
+        let slack_h = max_h.saturating_add(1);
+
+        while tiles.len() > 1 {
+            let area = Self::tiles_doc_area(tiles, scale);
+            let need_w = (area.width() * scale).ceil() as i32 + 2 * margins.width;
+            let need_h = (area.height() * scale).ceil() as i32 + 2 * margins.height;
+            if need_w <= slack_w && need_h <= slack_h {
+                break;
+            }
+
+            let min_x = tiles.iter().map(|t| t.x()).min().unwrap();
+            let max_x = tiles.iter().map(|t| t.x()).max().unwrap();
+            let min_y = tiles.iter().map(|t| t.y()).min().unwrap();
+            let max_y = tiles.iter().map(|t| t.y()).max().unwrap();
+
+            // Prefer shrinking the oversize axis; drop the edge farthest from centroid.
+            let drop_x = need_w > slack_w || (max_x - min_x) >= (max_y - min_y);
+            let drop_lo = if drop_x {
+                (cx - min_x as f32) >= (max_x as f32 - cx)
+            } else {
+                (cy - min_y as f32) >= (max_y as f32 - cy)
+            };
+
+            let edge_x = if drop_lo { min_x } else { max_x };
+            let edge_y = if drop_lo { min_y } else { max_y };
+
+            let mut kept = Vec::with_capacity(tiles.len());
+            for tile in tiles.drain(..) {
+                let on_edge = if drop_x {
+                    tile.x() == edge_x
+                } else {
+                    tile.y() == edge_y
+                };
+                if on_edge {
+                    deferred.push(tile);
+                } else {
+                    kept.push(tile);
+                }
+            }
+            *tiles = kept;
+            if tiles.is_empty() {
+                if let Some(t) = deferred.pop() {
+                    tiles.push(t);
+                }
+                break;
+            }
+        }
+        deferred
+    }
+
+    /// Drain pending uncached tiles into a paint-once region when safe.
+    /// Returns true when `paint_region` was started and nodes were seeded.
+    fn try_begin_paint_region(&mut self, root_ids: &[Uuid], tree: ShapesPoolRef) -> Result<bool> {
+        if self.viewer_masked_pass() || self.options.is_interactive_transform() {
+            println!(
+                "[PAINT-PERF] skip_paint_region viewer_mask={} interactive={}",
+                self.viewer_masked_pass(),
+                self.options.is_interactive_transform()
+            );
+            return Ok(false);
+        }
+        if self.paint_region.is_some() || !self.pending_nodes.is_empty() {
+            return Ok(false);
+        }
+
+        let pending_n = self.pending_tiles.list.len();
+        let mut region_tiles = Vec::new();
+        let mut cached_n = 0usize;
+        for tile in self.pending_tiles.list.drain(..) {
+            // Cached tiles are composed from the atlas; drop them from pending.
+            if self.surfaces.has_cached_tile_surface(tile) {
+                cached_n += 1;
+                continue;
+            }
+            // Include empty tiles too: the region AABB is the interest set, and
+            // the walker seeds roots (below) so shapes still get indexed/painted
+            // even when the tile grid is stale or sparse.
+            region_tiles.push(tile);
+        }
+
+        if region_tiles.is_empty() {
+            println!(
+                "[PAINT-PERF] skip_paint_region reason=no_uncached pending={} cached={}",
+                pending_n, cached_n
+            );
+            return Ok(false);
+        }
+
+        let empty_n = region_tiles
+            .iter()
+            .filter(|t| self.tiles.is_empty_at(**t))
+            .count();
+
+        let scale = self.get_scale();
+        let mut area = Self::tiles_doc_area(&region_tiles, scale);
+        let mut need = self.surfaces.paint_region_need_dims(area, scale);
+        let have = self.surfaces.paint_surface_size();
+
+        // Band to the current viewport-sized Current (do not grow to GPU max —
+        // that packed too much GPU work and hung the browser on Full present).
+        if region_tiles.len() > 1 && !self.surfaces.region_fits_paint_surface(area, scale) {
+            let before = region_tiles.len();
+            let deferred = Self::shrink_tiles_to_paint_fit(
+                &mut region_tiles,
+                scale,
+                self.surfaces.margins(),
+                have.width,
+                have.height,
+            );
+            self.pending_tiles.list.extend(deferred);
+            area = Self::tiles_doc_area(&region_tiles, scale);
+            need = self.surfaces.paint_region_need_dims(area, scale);
+            println!(
+                "[PAINT-PERF] band_paint_region {}→{} tiles need={}x{} have={}x{}",
+                before,
+                region_tiles.len(),
+                need.width,
+                need.height,
+                have.width,
+                have.height
+            );
+        }
+
+        let fits = self.surfaces.region_fits_paint_surface(area, scale);
+
+        if region_tiles.len() == 1 || !fits {
+            let reason = if region_tiles.len() == 1 {
+                "single_tile"
+            } else {
+                "too_big"
+            };
+            println!(
+                "[PAINT-PERF] skip_paint_region reason={} tiles={} empty≈{} area=({:.0}x{:.0})@{:.3} need={}x{} have={}x{} pending={} cached={}",
+                reason,
+                region_tiles.len(),
+                empty_n,
+                area.width(),
+                area.height(),
+                scale,
+                need.width,
+                need.height,
+                have.width,
+                have.height,
+                pending_n,
+                cached_n
+            );
             // Restore for the single-tile path (pop from end).
             self.pending_tiles.list.extend(region_tiles);
             return Ok(false);
         }
-
-        self.update_render_context_for_area(area);
-        self.current_tile = Some(region_tiles[0]);
-        self.current_tile_had_shapes = true;
-        self.tile_atlas_flushed = false;
-        self.drop_shadows_ops_warmed = false;
 
         let mut shape_ids: HashSet<Uuid> = HashSet::default();
         let mut region_has_bg_blur = false;
@@ -3902,7 +4104,9 @@ impl RenderState {
         }
 
         let mut valid_ids = Vec::new();
-        if region_has_bg_blur {
+        // Empty/stale tile index, or any bg-blur in the region: walk all roots
+        // so shapes are (re)indexed and painted into the region in one pass.
+        if shape_ids.is_empty() || region_has_bg_blur {
             valid_ids.extend(root_ids.iter().copied());
         } else {
             for root_id in root_ids {
@@ -3913,9 +4117,21 @@ impl RenderState {
         }
 
         if valid_ids.is_empty() {
+            println!(
+                "[PAINT-PERF] skip_paint_region reason=no_root_ids tiles={} shapes_in_tiles={}",
+                region_tiles.len(),
+                shape_ids.len()
+            );
             self.pending_tiles.list.extend(region_tiles);
             return Ok(false);
         }
+
+        // Current already covers viewport+interest; region was banded to fit.
+        self.update_render_context_for_area(area);
+        self.current_tile = Some(region_tiles[0]);
+        self.current_tile_had_shapes = true;
+        self.tile_atlas_flushed = false;
+        self.drop_shadows_ops_warmed = false;
 
         self.pending_nodes
             .extend(valid_ids.into_iter().map(|id| NodeRenderState {
@@ -3927,16 +4143,31 @@ impl RenderState {
                 flattened: false,
             }));
 
+        let n_tiles = region_tiles.len();
         self.paint_region = Some(PaintRegion {
             tiles: region_tiles,
         });
+        println!(
+            "[PAINT-PERF] begin_paint_region tiles={} area=({:.0},{:.0},{:.0}x{:.0}) scale={:.3} need={}x{} have={}x{}",
+            n_tiles,
+            area.left,
+            area.top,
+            area.width(),
+            area.height(),
+            scale,
+            need.width,
+            need.height,
+            have.width,
+            have.height
+        );
         Ok(true)
     }
 
     fn apply_paint_region_to_atlas(&mut self, region: &PaintRegion) -> Result<()> {
-        if self.tile_atlas_flushed {
-            crate::get_gpu_state().context.flush_and_submit();
-        }
+        let t0 = performance::get_time();
+        // Soft-drain only: hard flush_and_submit here waited on the whole
+        // paint-once backlog and hung the browser after zoom.
+        Self::drain_partial_gpu_soft();
         self.cache_cleared_this_render = true;
         let scale = self.get_scale();
         let render_area = self.render_area;
@@ -3956,6 +4187,14 @@ impl RenderState {
                 src,
             );
         }
+        println!(
+            "[PAINT-PERF] apply_paint_region tiles={} ms={}",
+            region.tiles.len(),
+            performance::get_time() - t0
+        );
+        // Yield one Partial before Full present so GPU work from this region
+        // is not synced in the same rAF as compose+present.
+        self.defer_full_after_paint_region = true;
         Ok(())
     }
 
@@ -3987,9 +4226,17 @@ impl RenderState {
                 // a previous pass; otherwise pass-1 pixels can leak into pass 2.
                 if self.viewer_masked_pass() || !self.surfaces.has_cached_tile_surface(current_tile)
                 {
+                    let paint_once = self.paint_region.is_some();
+                    let region_tiles = self
+                        .paint_region
+                        .as_ref()
+                        .map(|r| r.tiles.len())
+                        .unwrap_or(1);
                     performance::begin_measure!("render_shape_tree::uncached");
+                    let t_walk = performance::get_time();
                     let (is_empty, early_return) = self
                         .render_shape_tree_partial_uncached(tree, timestamp, allow_stop, false)?;
+                    let walk_ms = performance::get_time() - t_walk;
 
                     #[cfg(target_arch = "wasm32")]
                     if self.options.capture_frames > 0 {
@@ -3997,16 +4244,27 @@ impl RenderState {
                     }
 
                     if early_return {
+                        println!(
+                            "[PAINT-PERF] walker yield paint_once={} tiles≈{} walk={}ms",
+                            paint_once, region_tiles, walk_ms
+                        );
                         self.viewer_render_root = None;
                         return Ok(FrameType::Partial);
                     }
                     performance::end_measure!("render_shape_tree::uncached");
 
                     if let Some(region) = self.paint_region.take() {
+                        println!(
+                            "[PAINT-PERF] walker done paint_once tiles={} walk={}ms empty={}",
+                            region.tiles.len(),
+                            walk_ms,
+                            is_empty
+                        );
                         if !is_empty || self.current_tile_had_shapes {
                             self.apply_paint_region_to_atlas(&region)?;
                         }
                     } else {
+                        let t_apply = performance::get_time();
                         let tile_rect = self.get_current_tile_bounds()?;
                         // Composite if the walker did work in this PAF (`!is_empty`) OR
                         // the tile has unfinished work from a previous PAF
@@ -4034,6 +4292,12 @@ impl RenderState {
                                 );
                             }
                         }
+                        println!(
+                            "[PAINT-PERF] walker done single_tile walk={}ms apply={}ms empty={}",
+                            walk_ms,
+                            performance::get_time() - t_apply,
+                            is_empty
+                        );
                     }
                 } else if self.tiles.is_empty_at(current_tile) {
                     self.surfaces.remove_cached_tile_surface(current_tile);
@@ -4125,6 +4389,13 @@ impl RenderState {
         }
 
         self.viewer_render_root = None;
+
+        // After cropping a paint-once region, yield before Full present so
+        // compose+flush_and_submit do not sync the whole region in one rAF.
+        if self.defer_full_after_paint_region {
+            println!("[PAINT-PERF] defer Full after paint-region apply");
+            return Ok(FrameType::Partial);
+        }
 
         // Mark cache as valid for render_from_cache.
         // Only update for full-quality renders (non-fast mode).

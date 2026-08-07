@@ -14,18 +14,26 @@ use std::collections::{HashMap, HashSet};
 const TEXTURES_CACHE_CAPACITY: usize = 1024;
 const TEXTURES_BATCH_DELETE: usize = 256;
 
-// This is the amount of extra space we're going to give to all the surfaces to render shapes.
-// If it's too big it could affect performance.
-const TILE_SIZE: i32 = tiles::TILE_SIZE as i32;
+/// Current / effect surfaces are `physical_tile × TILE_SIZE_MULTIPLIER` so
+/// blur/outset can bleed into a ¼-tile margin on each side.
 const TILE_SIZE_MULTIPLIER: i32 = 2;
-const TILE_MARGIN_SIZE: i32 = TILE_SIZE * TILE_SIZE_MULTIPLIER / 4;
-const TILE_DRAWABLE_RECT: IRect = IRect {
-    left: TILE_MARGIN_SIZE,
-    top: TILE_MARGIN_SIZE,
-    right: TILE_MARGIN_SIZE + TILE_SIZE,
-    bottom: TILE_MARGIN_SIZE + TILE_SIZE,
-};
 const DOC_ATLAS_MAX_DIM: i32 = 4096;
+
+#[inline(always)]
+fn tile_margin_size(physical_tile: i32) -> i32 {
+    physical_tile * TILE_SIZE_MULTIPLIER / 4
+}
+
+#[inline(always)]
+fn tile_drawable_irect(physical_tile: i32) -> IRect {
+    let m = tile_margin_size(physical_tile);
+    IRect {
+        left: m,
+        top: m,
+        right: m + physical_tile,
+        bottom: m + physical_tile,
+    }
+}
 
 /// GPU→GPU copy of `src` from `from` into `dst` on `to_canvas`, without
 /// `image_snapshot` (avoids per-tile sync stalls on WebGL).
@@ -50,7 +58,7 @@ fn draw_surface_src_rect_to_dst(
     to_canvas.restore();
 }
 
-pub fn get_cache_size(viewbox: &Viewbox, interest: i32) -> skia::ISize {
+pub fn get_cache_size(viewbox: &Viewbox, interest: i32, physical_tile: i32) -> skia::ISize {
     // First we retrieve the extended area of the viewport that we could render.
     let TileRect(isx, isy, iex, iey) =
         tiles::get_tiles_for_viewbox_with_interest(viewbox, interest);
@@ -59,8 +67,8 @@ pub fn get_cache_size(viewbox: &Viewbox, interest: i32) -> skia::ISize {
     let dy = if isy.signum() != iey.signum() { 1 } else { 0 };
 
     (
-        ((iex - isx).abs() + dx) * TILE_SIZE,
-        ((iey - isy).abs() + dy) * TILE_SIZE,
+        ((iex - isx).abs() + dx) * physical_tile,
+        ((iey - isy).abs() + dy) * physical_tile,
     )
         .into()
 }
@@ -205,7 +213,7 @@ impl DocAtlas {
         // Keep the highest possible scale (closest to 1.0) that still fits.
         let cap = gpu_state
             .max_texture_size()
-            .clamp(TILE_SIZE, DOC_ATLAS_MAX_DIM) as f32;
+            .clamp(tiles::TILE_SIZE as i32, DOC_ATLAS_MAX_DIM) as f32;
 
         let required_scale = (cap / doc_w).min(cap / doc_h).clamp(0.01, 1.0);
 
@@ -454,6 +462,8 @@ pub struct Surfaces {
     // Tracks which surfaces have content (dirty flag bitmask)
     dirty_surfaces: u32,
     extra_tile_dims: skia::ISize,
+    /// Device-pixel edge of one atlas tile (`512 × dpr`).
+    physical_tile: i32,
     dpr: f32,
 }
 
@@ -465,10 +475,11 @@ impl Surfaces {
         tile_dims: skia::ISize,
     ) -> Result<Self> {
         let gpu_state = get_gpu_state();
+        let physical_tile = tile_dims.width.max(1);
 
         let extra_tile_dims = skia::ISize::new(
-            tile_dims.width * TILE_SIZE_MULTIPLIER,
-            tile_dims.height * TILE_SIZE_MULTIPLIER,
+            physical_tile * TILE_SIZE_MULTIPLIER,
+            physical_tile * TILE_SIZE_MULTIPLIER,
         );
         let margins = skia::ISize::new(extra_tile_dims.width / 4, extra_tile_dims.height / 4);
 
@@ -503,9 +514,9 @@ impl Surfaces {
         let ui = gpu_state.create_surface_with_dimensions("ui".to_string(), width, height)?;
         let debug = gpu_state.create_surface_with_dimensions("debug".to_string(), width, height)?;
 
-        // 512, why not?
-        let tiles = TileTextureCache::new(tile_atlas.width(), 512);
+        let tiles = TileTextureCache::new(tile_atlas.width(), physical_tile, 512);
         let atlas = DocAtlas::try_new()?;
+        let dpr = physical_tile as f32 / tiles::TILE_SIZE;
         Ok(Self {
             target,
             filter,
@@ -532,12 +543,63 @@ impl Surfaces {
             margins,
             dirty_surfaces: 0,
             extra_tile_dims,
-            dpr: 1.0,
+            physical_tile,
+            dpr,
         })
     }
 
-    pub fn set_dpr(&mut self, dpr: f32) {
+    pub fn physical_tile_size(&self) -> i32 {
+        self.physical_tile
+    }
+
+    pub fn drawable_irect(&self) -> IRect {
+        tile_drawable_irect(self.physical_tile)
+    }
+
+    /// Recreate Current / effect / atlas-slot surfaces for a new DPR.
+    /// Returns true when physical tile size changed (caller should invalidate caches).
+    pub fn set_dpr(&mut self, dpr: f32) -> Result<bool> {
         self.dpr = dpr;
+        let new_phys = tiles::physical_tile_size(dpr);
+        if new_phys == self.physical_tile {
+            return Ok(false);
+        }
+
+        let gpu_state = get_gpu_state();
+        let extra_tile_dims = skia::ISize::new(
+            new_phys * TILE_SIZE_MULTIPLIER,
+            new_phys * TILE_SIZE_MULTIPLIER,
+        );
+        let margins = skia::ISize::new(extra_tile_dims.width / 4, extra_tile_dims.height / 4);
+
+        self.filter =
+            gpu_state.create_surface_with_isize("filter".to_string(), extra_tile_dims)?;
+        self.current =
+            gpu_state.create_surface_with_isize("current".to_string(), extra_tile_dims)?;
+        self.drop_shadows =
+            gpu_state.create_surface_with_isize("drop_shadows".to_string(), extra_tile_dims)?;
+        self.inner_shadows =
+            gpu_state.create_surface_with_isize("inner_shadows".to_string(), extra_tile_dims)?;
+        self.text_drop_shadows =
+            gpu_state.create_surface_with_isize("text_drop_shadows".to_string(), extra_tile_dims)?;
+        self.shape_fills =
+            gpu_state.create_surface_with_isize("shape_fills".to_string(), extra_tile_dims)?;
+        self.shape_strokes =
+            gpu_state.create_surface_with_isize("shape_strokes".to_string(), extra_tile_dims)?;
+        // Keep export at least as large as the new tile work surface.
+        self.export =
+            gpu_state.create_surface_with_isize("export".to_string(), extra_tile_dims)?;
+
+        self.tiles = TileTextureCache::new(self.tile_atlas.width(), new_phys, 512);
+        self.tile_atlas.canvas().clear(skia::Color::TRANSPARENT);
+        self.tile_atlas_image = None;
+        self.atlas.tile_doc_rects.clear();
+
+        self.physical_tile = new_phys;
+        self.extra_tile_dims = extra_tile_dims;
+        self.margins = margins;
+        self.clear_all_dirty();
+        Ok(true)
     }
 
     pub fn clear_tiles(&mut self) {
@@ -996,8 +1058,8 @@ impl Surfaces {
             .ok_or(Error::CriticalError("Failed to create surface".to_string()))?;
         self.cache.canvas().reset_matrix();
         self.cache.canvas().translate((
-            (interest_area_threshold * TILE_SIZE) as f32,
-            (interest_area_threshold * TILE_SIZE) as f32,
+            (interest_area_threshold * self.physical_tile) as f32,
+            (interest_area_threshold * self.physical_tile) as f32,
         ));
         Ok(())
     }
@@ -1008,8 +1070,10 @@ impl Surfaces {
         cached_viewbox: &Viewbox,
         interest_area_threshold: i32,
     ) -> Result<()> {
-        let viewbox_cache_size = get_cache_size(viewbox, interest_area_threshold);
-        let cached_viewbox_cache_size = get_cache_size(cached_viewbox, interest_area_threshold);
+        let viewbox_cache_size =
+            get_cache_size(viewbox, interest_area_threshold, self.physical_tile);
+        let cached_viewbox_cache_size =
+            get_cache_size(cached_viewbox, interest_area_threshold, self.physical_tile);
         // Only resize cache if the new size is larger than the cached size
         // This avoids unnecessary surface recreations when the cache size decreases
         if viewbox_cache_size.width > cached_viewbox_cache_size.width
@@ -1207,8 +1271,8 @@ impl Surfaces {
     /// Debug: semi-transparent tint unique per tile coords, baked into Current
     /// before atlas/backbuffer blit so tile boundaries are visible on screen.
     pub fn paint_debug_tile_overlay(&mut self, tile: &Tile) {
+        let rect = skia::Rect::from(self.drawable_irect());
         let canvas = self.current.canvas();
-        let rect = skia::Rect::from(TILE_DRAWABLE_RECT);
 
         // Stable pseudo-random RGB from tile coords (same tile → same color).
         let h = (tile.x() as u32)
@@ -1242,7 +1306,7 @@ impl Surfaces {
         self.paint_debug_tile_overlay(tile);
 
         let gpu_state = get_gpu_state();
-        let src = skia::Rect::from(TILE_DRAWABLE_RECT);
+        let src = skia::Rect::from(self.drawable_irect());
         let sampling = self.sampling_options;
 
         // DocAtlas + tile atlas via Surface::draw (no image_snapshot sync).
@@ -1310,7 +1374,9 @@ impl Surfaces {
         let canvas = scratch.canvas();
         canvas.clear(skia::Color::TRANSPARENT);
 
-        let tile_size = tiles::get_tile_size(scale);
+        // Grid uses zoom only; `scale` is paint scale (zoom×dpr) for screen mapping.
+        let zoom = scale / self.dpr.max(0.01);
+        let tile_size = tiles::get_tile_size(zoom);
         let tr = tiles::get_tiles_for_rect(src_doc_bounds, tile_size);
         let ix0 = src_irect.left as f32;
         let iy0 = src_irect.top as f32;
@@ -1319,7 +1385,7 @@ impl Surfaces {
         for ty in tr.y1()..=tr.y2() {
             for tx in tr.x1()..=tr.x2() {
                 let tile = Tile(tx, ty);
-                let tile_doc = tiles::get_tile_rect(tile, scale);
+                let tile_doc = tiles::get_tile_rect(tile, zoom);
                 let mut clip_doc = tile_doc;
                 if !clip_doc.intersect(src_doc_bounds) || clip_doc.is_empty() {
                     continue;
@@ -1612,11 +1678,12 @@ impl AtlasDrawBatch {
 }
 
 impl TileTextureCache {
-    pub fn new(texture_size: i32, capacity: usize) -> Self {
+    pub fn new(texture_size: i32, physical_tile: i32, capacity: usize) -> Self {
+        let physical_tile = physical_tile.max(1);
         Self {
-            tile_size: tiles::TILE_SIZE,
+            tile_size: physical_tile as f32,
             is_updated: false,
-            provider: TileAtlasTextureProvider::new(texture_size, TILE_SIZE),
+            provider: TileAtlasTextureProvider::new(texture_size, physical_tile),
             transforms: Vec::with_capacity(capacity),
             textures: Vec::with_capacity(capacity),
             grid: HashMap::with_capacity(capacity),
@@ -1737,7 +1804,7 @@ impl TileTextureCache {
                 let doc_rect = tile_doc_rects
                     .get(&tile)
                     .copied()
-                    .unwrap_or_else(|| tiles::get_tile_rect(tile, s));
+                    .unwrap_or_else(|| tiles::get_tile_rect(tile, viewbox.zoom()));
                 if doc_rect.is_empty() || !doc_rect.intersects(view_doc) {
                     continue;
                 }
@@ -1761,7 +1828,7 @@ impl TileTextureCache {
             let doc_rect = tile_doc_rects
                 .get(&tile)
                 .copied()
-                .unwrap_or_else(|| tiles::get_tile_rect(tile, s));
+                .unwrap_or_else(|| tiles::get_tile_rect(tile, viewbox.zoom()));
             if doc_rect.is_empty() || !doc_rect.intersects(view_doc) {
                 continue;
             }

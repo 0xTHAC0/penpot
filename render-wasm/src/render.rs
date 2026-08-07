@@ -555,7 +555,7 @@ impl RenderState {
         let surfaces = Surfaces::try_new(
             (width, height),
             sampling_options,
-            tiles::get_tile_dimensions(),
+            tiles::get_tile_dimensions(1.0),
         )?;
 
         Self::assemble(width, height, surfaces)
@@ -876,15 +876,24 @@ impl RenderState {
         // Only when this function returns true (it means the value
         // was properly changed) the rest of the functions is called.
         if self.options.set_dpr(dpr) {
+            // Grid is zoom-only; interest is a tile-count margin (not ×dpr).
             self.tile_viewbox
                 .set_interest(self.options.dpr_viewport_interest_area_threshold);
+            self.viewbox.set_dpr(dpr);
+            get_resources().fonts.set_scale_debug_font(dpr);
+
+            // Viewport surfaces (Target/Backbuffer) scale with CSS×dpr.
             self.resize(
                 self.viewbox.width().floor() as i32,
                 self.viewbox.height().floor() as i32,
             )?;
-            get_resources().fonts.set_scale_debug_font(dpr);
-            self.viewbox.set_dpr(dpr);
-            self.surfaces.set_dpr(dpr);
+
+            // Grow/shrink physical tile work surfaces + atlas slots; drop
+            // cached textures (same doc grid, wrong pixel density).
+            if self.surfaces.set_dpr(dpr)? {
+                self.surfaces.invalidate_tile_cache();
+                self.tile_viewbox.update(&self.viewbox);
+            }
         }
         Ok(())
     }
@@ -2001,8 +2010,10 @@ impl RenderState {
 
     pub fn update_render_context(&mut self, tile: tiles::Tile) {
         self.current_tile = Some(tile);
+        let zoom = self.viewbox.zoom();
         let scale = self.get_scale();
-        self.render_area = tiles::get_tile_rect(tile, scale);
+        // Doc-space tile rect depends only on zoom (DPR-independent grid).
+        self.render_area = tiles::get_tile_rect(tile, zoom);
         let margins = self.surfaces.margins();
         let margin_w = margins.width as f32 / scale;
         let margin_h = margins.height as f32 / scale;
@@ -2012,6 +2023,7 @@ impl RenderState {
             self.render_area.right + margin_w,
             self.render_area.bottom + margin_h,
         );
+        // Canvas CTM still uses paint scale (zoom×dpr) for HiDPI sharpness.
         self.surfaces.update_render_context(self.render_area, scale);
     }
 
@@ -2942,7 +2954,8 @@ impl RenderState {
             .current_tile
             .ok_or(Error::CriticalError("Current tile not found".to_string()))?;
         let offset = self.viewbox.get_offset();
-        Ok(tile.get_rect_with_offset(&offset))
+        let phys = self.surfaces.physical_tile_size() as f32;
+        Ok(tile.get_rect_with_offset(&offset, phys))
     }
 
     pub fn get_rect_bounds(&mut self, rect: skia::Rect) -> Rect {
@@ -2970,15 +2983,14 @@ impl RenderState {
 
     pub fn get_aligned_tile_bounds(&mut self, tile: tiles::Tile) -> Rect {
         let scale = self.get_scale();
-        let start_tile_x =
-            (self.viewbox.area.left * scale / tiles::TILE_SIZE).floor() * tiles::TILE_SIZE;
-        let start_tile_y =
-            (self.viewbox.area.top * scale / tiles::TILE_SIZE).floor() * tiles::TILE_SIZE;
+        let phys = self.surfaces.physical_tile_size() as f32;
+        let start_tile_x = (self.viewbox.area.left * scale / phys).floor() * phys;
+        let start_tile_y = (self.viewbox.area.top * scale / phys).floor() * phys;
         Rect::from_xywh(
-            (tile.x() as f32 * tiles::TILE_SIZE) - start_tile_x,
-            (tile.y() as f32 * tiles::TILE_SIZE) - start_tile_y,
-            tiles::TILE_SIZE,
-            tiles::TILE_SIZE,
+            (tile.x() as f32 * phys) - start_tile_x,
+            (tile.y() as f32 * phys) - start_tile_y,
+            phys,
+            phys,
         )
     }
 
@@ -2987,9 +2999,7 @@ impl RenderState {
     //
     // Unlike `get_current_tile_bounds`, which calculates bounds using the exact
     // scaled offset of the viewbox, this method snaps the origin to the nearest
-    // lower multiple of `TILE_SIZE`. This ensures the tile bounds are aligned
-    // with the global tile grid, which is useful for rendering tiles in a
-    /// consistent and predictable layout.
+    // lower multiple of the physical tile size (`512 × dpr`).
     pub fn get_current_aligned_tile_bounds(&mut self) -> Result<Rect> {
         Ok(self.get_aligned_tile_bounds(
             self.current_tile
@@ -3976,9 +3986,10 @@ impl RenderState {
      * render_shape_tree_partial_uncached, ensuring all shapes render correctly.
      */
     pub fn get_tiles_for_shape(&mut self, shape: &Shape, tree: ShapesPoolRef) -> TileRect {
-        let scale = self.get_scale();
-        let extrect = self.get_cached_extrect(shape, tree, scale);
-        let tile_size = tiles::get_tile_size(scale);
+        let zoom = self.viewbox.zoom();
+        // Extents and tile size use zoom only so the grid is DPR-independent.
+        let extrect = self.get_cached_extrect(shape, tree, zoom);
+        let tile_size = tiles::get_tile_size(zoom);
         let shape_tiles = tiles::get_tiles_for_rect(extrect, tile_size);
         let interest_rect = &self.tile_viewbox.interest_rect;
         // Calculate the intersection of shape_tiles with interest_rect

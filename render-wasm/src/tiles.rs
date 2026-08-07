@@ -31,13 +31,14 @@ impl Tile {
         )
     }
 
+    /// Screen-space rect for this tile using the physical tile size (512×dpr).
     #[inline(always)]
-    pub fn get_rect_with_offset(&self, offset: &skia::Point) -> skia::Rect {
+    pub fn get_rect_with_offset(&self, offset: &skia::Point, physical_tile_size: f32) -> skia::Rect {
         skia::Rect::from_xywh(
-            self.0 as f32 * TILE_SIZE - offset.x,
-            self.1 as f32 * TILE_SIZE - offset.y,
-            TILE_SIZE,
-            TILE_SIZE,
+            self.0 as f32 * physical_tile_size - offset.x,
+            self.1 as f32 * physical_tile_size - offset.y,
+            physical_tile_size,
+            physical_tile_size,
         )
     }
 }
@@ -211,9 +212,23 @@ impl TileViewbox {
 
 pub const TILE_SIZE: f32 = 512.;
 
+/// Document-space size of one tile. Depends only on zoom (not DPR), so the
+/// shape→tile grid stays stable across HiDPI.
 #[inline(always)]
-pub fn get_tile_dimensions() -> skia::ISize {
-    (TILE_SIZE as i32, TILE_SIZE as i32).into()
+pub fn get_tile_size(zoom: f32) -> f32 {
+    TILE_SIZE / zoom
+}
+
+/// Physical GPU tile edge in device pixels: `512 × dpr` (ceiled).
+#[inline(always)]
+pub fn physical_tile_size(dpr: f32) -> i32 {
+    (TILE_SIZE * dpr).ceil().max(1.0) as i32
+}
+
+#[inline(always)]
+pub fn get_tile_dimensions(dpr: f32) -> skia::ISize {
+    let s = physical_tile_size(dpr);
+    (s, s).into()
 }
 
 pub fn get_tiles_for_rect(rect: skia::Rect, tile_size: f32) -> TileRect {
@@ -227,7 +242,7 @@ pub fn get_tiles_for_rect(rect: skia::Rect, tile_size: f32) -> TileRect {
 }
 
 pub fn get_tiles_for_viewbox(viewbox: &Viewbox) -> TileRect {
-    let tile_size = get_tile_size(viewbox.get_scale());
+    let tile_size = get_tile_size(viewbox.zoom());
     get_tiles_for_rect(viewbox.area, tile_size)
 }
 
@@ -241,20 +256,14 @@ pub fn get_tile_center_for_viewbox(viewbox: &Viewbox) -> Tile {
     Tile((ex - sx) / 2, (ey - sy) / 2)
 }
 
-pub fn get_tile_pos(Tile(x, y): Tile, scale: f32) -> (f32, f32) {
-    (
-        x as f32 * get_tile_size(scale),
-        y as f32 * get_tile_size(scale),
-    )
+pub fn get_tile_pos(Tile(x, y): Tile, zoom: f32) -> (f32, f32) {
+    let ts = get_tile_size(zoom);
+    (x as f32 * ts, y as f32 * ts)
 }
 
-pub fn get_tile_size(scale: f32) -> f32 {
-    1. / scale * TILE_SIZE
-}
-
-pub fn get_tile_rect(tile: Tile, scale: f32) -> skia::Rect {
-    let (tx, ty) = get_tile_pos(tile, scale);
-    let ts = get_tile_size(scale);
+pub fn get_tile_rect(tile: Tile, zoom: f32) -> skia::Rect {
+    let (tx, ty) = get_tile_pos(tile, zoom);
+    let ts = get_tile_size(zoom);
     skia::Rect::from_xywh(tx, ty, ts, ts)
 }
 

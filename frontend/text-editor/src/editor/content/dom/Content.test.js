@@ -43,6 +43,19 @@ describe("Content", () => {
     expect(contentFragment.textContent).toBe("Hello, World!");
   });
 
+  test("mapContentFragmentFromHTML should map the HTML structure when HTML paste is allowed", () => {
+    const inertElement = document.createElement("div");
+    const contentFragment = mapContentFragmentFromHTML(
+      "<div>Hello, <b>World!</b></div>",
+      inertElement.style,
+      true,
+    );
+    expect(contentFragment).toBeInstanceOf(DocumentFragment);
+    expect(contentFragment.children).toHaveLength(1);
+    expect(contentFragment.firstElementChild.children).toHaveLength(2);
+    expect(contentFragment.textContent).toBe("Hello, World!");
+  });
+
   /*
   test("mapContentFragmentFromHTML should return a valid content for the editor (multiple paragraphs)", () => {
     const paragraphs = [

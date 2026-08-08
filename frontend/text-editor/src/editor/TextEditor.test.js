@@ -1,5 +1,5 @@
 import { describe, test, expect } from "vitest";
-import { TextEditor } from "./TextEditor.js";
+import { TextEditor, createRootFromHTML } from "./TextEditor.js";
 
 /* @vitest-environment jsdom */
 describe("TextEditor", () => {
@@ -96,5 +96,25 @@ describe("TextEditor", () => {
     textEditor.selectAll();
     expect(document.activeElement).toBe(textEditor.element);
     expect(selection.containsNode(textEditor.root));
+  });
+
+  test("createRootFromHTML should keep the HTML structure when HTML paste is allowed", () => {
+    const root = createRootFromHTML(
+      "<div>Hello, <b>World!</b></div>",
+      undefined,
+      true,
+    );
+    expect(root.dataset.itype).toBe("root");
+    expect(root.children).toHaveLength(1);
+    expect(root.firstElementChild.children).toHaveLength(2);
+    expect(root.textContent).toBe("Hello, World!");
+  });
+
+  test("createRootFromHTML should flatten to plain text when HTML paste is not allowed", () => {
+    const root = createRootFromHTML("<div>Hello, <b>World!</b></div>");
+    expect(root.dataset.itype).toBe("root");
+    expect(root.children).toHaveLength(1);
+    expect(root.firstElementChild.children).toHaveLength(1);
+    expect(root.textContent).toBe("Hello, World!");
   });
 });

@@ -207,7 +207,11 @@ export function mapContentFragmentFromHTML(
     try {
       const parser = new DOMParser();
       const document = parser.parseFromString(html, "text/html");
-      return mapContentFragmentFromDocument(document, styleDefaults);
+      return mapContentFragmentFromDocument(
+        document,
+        document.body,
+        styleDefaults,
+      );
     } catch (error) {
       console.error("Couldn't parse HTML", html, error);
       const plainText = htmlToText(html);

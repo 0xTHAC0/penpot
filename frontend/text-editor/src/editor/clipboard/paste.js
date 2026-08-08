@@ -15,6 +15,7 @@ import { TextEditor } from "../TextEditor.js";
 /**
  * Returns a DocumentFragment from text/html.
  *
+ * @param {SelectionController} selectionController
  * @param {DataTransfer} clipboardData
  * @returns {DocumentFragment}
  */
@@ -25,12 +26,14 @@ function getFormattedFragmentFromClipboardData(
   return mapContentFragmentFromHTML(
     clipboardData.getData("text/html"),
     selectionController.currentStyle,
+    true,
   );
 }
 
 /**
  * Returns a DocumentFragment from text/plain.
  *
+ * @param {SelectionController} selectionController
  * @param {DataTransfer} clipboardData
  * @returns {DocumentFragment}
  */
@@ -44,6 +47,7 @@ function getPlainFragmentFromClipboardData(selectionController, clipboardData) {
 /**
  * Returns a document fragment of html data.
  *
+ * @param {SelectionController} selectionController
  * @param {DataTransfer} clipboardData
  * @returns {DocumentFragment}
  */
@@ -83,6 +87,7 @@ export function paste(event, editor, selectionController) {
   let fragment = null;
   if (editor?.options?.allowHTMLPaste) {
     fragment = getFormattedOrPlainFragmentFromClipboardData(
+      selectionController,
       event.clipboardData,
     );
   } else {
